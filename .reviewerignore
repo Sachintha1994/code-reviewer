@@ -1,0 +1,3 @@
+# Folders the reviewer skips when reviewing this project itself
+# (the sample project has deliberate problems for the tests and benchmark)
+tests/fixtures
