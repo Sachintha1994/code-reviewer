@@ -35,13 +35,13 @@ The command exits with 1 on FAIL (add `--strict` to fail on WARN too), so it can
 
 | Gate | Tool | Blocks? |
 |---|---|---|
-| Build | Python compiler, `tsc` | yes |
-| Tests, coverage | pytest, pytest-cov, Codecov | yes (new code ≥ 80%), warn (overall ≥ 70%) |
+| Build | Maven (Java), Python compiler, `tsc` | yes |
+| Tests, coverage | Maven + JaCoCo, pytest + pytest-cov, Codecov | yes (new code ≥ 80%), warn (overall ≥ 70%) |
 | Secrets | gitleaks (built-in patterns if missing) | yes |
 | SAST | Semgrep, Bandit | yes, on high/critical |
-| Dependency CVEs | Trivy | yes, on high/critical |
-| Lint | Ruff (Flake8 fallback), ESLint | yes, on real bugs only; style issues don't block |
-| Type check | mypy | yes |
+| Dependency CVEs | Trivy (turned off by default: see `disabled_scanners`) | yes, on high/critical |
+| Lint | PMD (Java), Ruff (Flake8 fallback), ESLint | yes, on real bugs only; style issues don't block |
+| Type check | mypy (Java and TypeScript are checked by their compilers) | yes |
 | Complexity | Lizard (Radon fallback) | warn over 15, block over 25 |
 | Duplication | jscpd | warn over 5% |
 | Function/file size | Lizard | warn |
@@ -59,7 +59,12 @@ dashboard's **Installed tools** panel shows what's available.
 - **gitleaks** and **Trivy:** download the Windows release and put `gitleaks.exe` and
   `trivy.exe` next to `main.py`, or anywhere on PATH, or set `tools.trivy` / `tools.gitleaks`
   in `quality-gates.yml`. Trivy downloads its vulnerability database on first run.
-- **jscpd:** `npm install -g jscpd`.
+- **jscpd:** needs Node.js, then `npm install -g jscpd`.
+- **Java projects:** Maven and a JDK on PATH (or an `mvnw` wrapper in the project). One Maven
+  run compiles the code, runs the tests and measures coverage with JaCoCo, without changing
+  the project's `pom.xml`. For lint, download PMD 7 from https://pmd.github.io, unzip it and
+  add its `bin` folder to PATH (or set `tools.pmd` in `quality-gates.yml`).
+- **Turning a scanner off:** list it in `disabled_scanners` in `quality-gates.yml`.
 
 ## How it keeps results accurate
 

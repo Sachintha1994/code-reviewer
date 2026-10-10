@@ -270,7 +270,9 @@ class Scanner:
 
     def run(self, ctx: ScanContext) -> ScanResult:
         start = time.time()
-        reason = self.applies(ctx)
+        started_as = self.name
+        disabled = {str(n).lower() for n in (ctx.config.get("disabled_scanners") or [])}
+        reason = "turned off in quality-gates.yml (disabled_scanners)" if self.name.lower() in disabled else self.applies(ctx)
         if reason:
             result = ScanResult(tool=self.name, category=self.category, status=ScanStatus.SKIPPED, message=reason,
                                 not_applicable=True)
@@ -289,6 +291,10 @@ class Scanner:
         for f in result.findings:
             if not f.tools:
                 f.tools = [f.tool]
+        if self.name != started_as:
+            # e.g. gitleaks missing, built-in patterns used instead: close the first entry too
+            ctx.progress({"tool": started_as, "category": self.category, "status": "skipped",
+                          "message": f"not installed; used {self.name} instead", "findings": 0})
         ctx.progress({"tool": self.name, "category": self.category, "status": result.status.value,
                       "message": result.message, "findings": len(result.findings)})
         return result

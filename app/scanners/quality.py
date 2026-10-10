@@ -94,6 +94,11 @@ class TypeCheckScanner(Scanner):
     category = "types"
     languages = ("python",)
 
+    def applies(self, ctx: ScanContext):
+        if "python" not in ctx.languages and {"java", "kotlin", "csharp", "typescript"} & set(ctx.languages):
+            return "types in this language are checked by its compiler (see the Build gate)"
+        return super().applies(ctx)
+
     def scan(self, ctx: ScanContext):
         mypy = find_tool("mypy", ctx.config, python_module="mypy")
         files = ctx.files_for("python")

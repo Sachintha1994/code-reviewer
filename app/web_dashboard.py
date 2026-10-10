@@ -362,6 +362,8 @@ TOOLS = [
     ("lizard", "lizard", "pip install lizard"), ("gitleaks", None, "download from github.com/gitleaks/gitleaks/releases"),
     ("trivy", None, "download from github.com/aquasecurity/trivy/releases"), ("pytest", "pytest", "pip install pytest pytest-cov"),
     ("jscpd", None, "npm install -g jscpd"), ("git", None, "install Git"),
+    ("mvn", None, "install Maven and a JDK (or use the project's mvnw)"),
+    ("pmd", None, "download PMD 7 from pmd.github.io and add its bin folder to PATH"),
 ]
 
 

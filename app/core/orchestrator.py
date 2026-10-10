@@ -23,6 +23,7 @@ from app.scanners.base import (
 )
 from app.scanners.codecov_client import CodecovScanner
 from app.scanners.github_security import GitHubSecurityScanner
+from app.scanners.java import MavenScanner, PMDScanner
 from app.scanners.lint import ESLintScanner, PythonLintScanner
 from app.scanners.quality import (
     BuildScanner, ComplexityScanner, DuplicationScanner, HygieneScanner, PytestScanner, TypeCheckScanner,
@@ -58,7 +59,8 @@ class CodeReviewOrchestrator:
 
     def scanners(self) -> List[Scanner]:
         return [
-            BuildScanner(), SecretsScanner(), PythonLintScanner(), ESLintScanner(), TypeCheckScanner(),
+            MavenScanner(), BuildScanner(), SecretsScanner(), PythonLintScanner(), ESLintScanner(), PMDScanner(),
+            TypeCheckScanner(),
             SemgrepScanner(), BanditScanner(), TrivyScanner(), ComplexityScanner(), DuplicationScanner(),
             PytestScanner(), HygieneScanner(), SonarQubeScanner(self.sonar_config),
             CodecovScanner(self.codecov_config), GitHubSecurityScanner(self.ghas_config),

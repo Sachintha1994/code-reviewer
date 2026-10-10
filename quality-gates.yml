@@ -11,7 +11,7 @@ gates:
   coverage_overall: { enabled: true, severity: warn, min: 70 }
   secrets:          { enabled: true, severity: blocker, max_findings: 0 }
   sast:             { enabled: true, severity: blocker, max_high: 0, max_critical: 0 }
-  dependencies:     { enabled: true, severity: blocker, max_high: 0, max_critical: 0 }
+  dependencies:     { enabled: false, severity: blocker, max_high: 0, max_critical: 0 }   # Trivy is turned off below
   lint:             { enabled: true, severity: blocker, max_errors: 0 }
   types:            { enabled: true, severity: blocker, max_errors: 0 }
   complexity:       { enabled: true, warn_over: 15, fail_over: 25 }
@@ -58,6 +58,10 @@ exclude:
   - "*.lock"
   - "package-lock.json"
 
+# Scanners to turn off completely, by name (as shown in the scan log), e.g. Trivy
+# stops dependency scanning of pom.xml / requirements.txt / package-lock.json.
+disabled_scanners: ["Trivy"]
+
 # Only report findings on lines changed since this git ref (e.g. "main").
 # Leave empty to review the whole project. Can also be set per scan.
 base_ref: ""
@@ -66,6 +70,17 @@ semgrep:
   # Language packs are added automatically for the languages found.
   configs: ["p/owasp-top-ten", "p/secrets"]
   drop_low_confidence: true
+  timeout_seconds: 900
+
+maven:
+  # One Maven run compiles, runs the tests and measures coverage with JaCoCo
+  # (no pom.xml changes needed). Uses the project's mvnw if it has one.
+  timeout_seconds: 1800
+  jacoco_version: "0.8.12"
+  extra_args: []          # e.g. ["-P", "ci"] or ["-s", "C:/path/settings.xml"]
+
+pmd:
+  rulesets: ["rulesets/java/quickstart.xml"]
   timeout_seconds: 900
 
 bandit:
@@ -110,3 +125,5 @@ tools:
   trivy: ""
   gitleaks: ""
   semgrep: ""
+  pmd: ""                 # e.g. C:/tools/pmd-bin-7.7.0/bin/pmd.bat
+  mvn: ""

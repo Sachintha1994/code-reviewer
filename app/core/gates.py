@@ -81,25 +81,28 @@ def _high_plus(findings: List[Finding]) -> List[Finding]:
 
 
 def gate_build(ctx: _Ctx) -> GateResult:
-    return _count_gate("build", ctx, ctx.scans_for("Build"), ctx.by_cat[Category.BUILD], 0, "compile errors")
+    return _count_gate("build", ctx, ctx.scans_for("Build", "Maven"), ctx.by_cat[Category.BUILD], 0, "compile errors")
 
 
 def gate_tests(ctx: _Ctx) -> GateResult:
     gcfg = gate_cfg(ctx.cfg, "tests")
-    scans = ctx.scans_for("pytest")
-    rate = ctx.metric("pass_rate", "pytest")
+    scans = ctx.scans_for("pytest", "Maven")
+    rate = ctx.metric("pass_rate", "pytest", "Maven")
     minimum = float(gcfg.get("min_pass_rate", 100))
     sev = gcfg.get("severity", "blocker")
     if rate is None:
         _, _, missing = _tool_state(scans)
         na = _not_applicable(scans)
+        if not na and any(s.status == ScanStatus.RAN and s.metrics.get("tests") == 0 for s in scans):
+            na = "no tests found"
         return GateResult(key="tests", name=GATE_NAMES["tests"], status=GateStatus.SKIPPED, severity=sev,
                           threshold=f">= {minimum:g}%", details=na or missing or "no tests ran",
                           tools=[s.tool for s in scans], not_applicable=bool(na))
-    totals = next((s.metrics for s in scans if s.status == ScanStatus.RAN), {})
+    source = next(s for s in scans if s.status == ScanStatus.RAN and s.metrics.get("pass_rate") is not None)
+    totals = source.metrics
     status = GateStatus.PASSED if rate >= minimum else GateStatus.FAILED
     return GateResult(key="tests", name=GATE_NAMES["tests"], status=status, severity=sev, actual=f"{rate:g}%",
-                      threshold=f">= {minimum:g}%", tools=["pytest"],
+                      threshold=f">= {minimum:g}%", tools=[source.tool],
                       details=f"{totals.get('passed', 0)} passed, {totals.get('failures', 0)} failed, "
                               f"{totals.get('errors', 0)} errors, {totals.get('skipped', 0)} skipped",
                       top_files=_top_files(ctx.by_cat[Category.TESTS]))
@@ -122,17 +125,17 @@ def gate_coverage_new(ctx: _Ctx) -> GateResult:
         gate = _coverage_gate("coverage_new", ctx, None, "needs a base branch to know which code is new", [])
         gate.not_applicable = True  # a whole-project review has no "new code"
         return gate
-    value = ctx.metric("coverage_new", "pytest")
-    reason = "coverage not measured (needs pytest-cov and tests)" if value is None else ""
-    if value is None and ctx.metric("coverage_new_lines", "pytest") == 0:
+    value = ctx.metric("coverage_new", "pytest", "Maven")
+    reason = "coverage not measured (needs tests plus pytest-cov or JaCoCo)" if value is None else ""
+    if value is None and ctx.metric("coverage_new_lines", "pytest", "Maven") == 0:
         reason = "no executable new lines"
-    return _coverage_gate("coverage_new", ctx, value, reason, ["pytest-cov"])
+    return _coverage_gate("coverage_new", ctx, value, reason, ["pytest-cov", "JaCoCo"])
 
 
 def gate_coverage_overall(ctx: _Ctx) -> GateResult:
-    value = ctx.metric("coverage_overall", "pytest", "Codecov")
-    return _coverage_gate("coverage_overall", ctx, value, "coverage not measured (needs pytest-cov or Codecov)",
-                          ["pytest-cov", "Codecov"])
+    value = ctx.metric("coverage_overall", "pytest", "Maven", "Codecov")
+    return _coverage_gate("coverage_overall", ctx, value, "coverage not measured (needs pytest-cov, JaCoCo or Codecov)",
+                          ["pytest-cov", "JaCoCo", "Codecov"])
 
 
 def gate_secrets(ctx: _Ctx) -> GateResult:
@@ -172,7 +175,7 @@ def gate_lint(ctx: _Ctx) -> GateResult:
     lint = ctx.by_cat[Category.LINT]
     errors = _high_plus(lint)
     extra = f"; {len(lint) - len(errors)} warnings/style issues (not blocking)" if len(lint) > len(errors) else ""
-    return _count_gate("lint", ctx, ctx.scans_for("Ruff", "Flake8", "ESLint"), errors,
+    return _count_gate("lint", ctx, ctx.scans_for("Ruff", "Flake8", "ESLint", "PMD"), errors,
                        int(gcfg.get("max_errors", 0)), "errors", extra)
 
 
