@@ -1,144 +1,135 @@
-"""Runs every scanner, post-processes the findings and evaluates the gates."""
+"""Finds the code to review (changes since a base branch, or the whole project),
+has the AI review it, and builds the result."""
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.config import DATA_DIR, load_config
 from app.core import findings as fx
-from app.core.context import clear_cache as clear_ast_cache
-from app.core.context import extract_context
+from app.core.ai_review import AIReviewer
 from app.core.diff import DiffError, collect_diff
-from app.core.gates import decide_verdict, evaluate_gates, health_score
-from app.core.llm_analyzer import AIReviewer
-from app.core.models import Category, Finding, ReviewResult, ScanResult, ScanStatus
-from app.scanners.base import (
-    LANGUAGE_BY_EXT, ScanContext, Scanner, clear_line_cache, detect_languages, discover_files, exclude_patterns,
-    is_excluded, read_lines,
-)
-from app.scanners.codecov_client import CodecovScanner
-from app.scanners.github_security import GitHubSecurityScanner
-from app.scanners.java import MavenScanner, PMDScanner
-from app.scanners.lint import ESLintScanner, PythonLintScanner
-from app.scanners.quality import (
-    BuildScanner, ComplexityScanner, DuplicationScanner, HygieneScanner, PytestScanner, TypeCheckScanner,
-)
-from app.scanners.security import BanditScanner, SecretsScanner, SemgrepScanner, TrivyScanner
-from app.scanners.sonarqube_client import SonarQubeScanner
+from app.core.files import clear_line_cache, exclude_patterns, is_excluded, language_of, read_lines
+from app.core.models import FileReview, Finding, ReviewResult
 
 ProgressFn = Callable[[Dict[str, Any]], None]
 GITHUB_URL = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?(\.git)?/?$")
-MAX_CONTEXT_FINDINGS = 300
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class CodeReviewOrchestrator:
-    def __init__(self, target_path: str, sonar_config: Optional[dict] = None, codecov_config: Optional[dict] = None,
-                 ghas_config: Optional[dict] = None, base_ref: Optional[str] = None,
-                 config_overrides: Optional[dict] = None, use_ai: bool = True, baseline: Optional[Set[str]] = None,
-                 suppressions: Optional[Dict[str, str]] = None, is_remote: bool = False,
-                 progress: Optional[ProgressFn] = None, cache_get=None, cache_set=None, max_workers: int = 4):
+    def __init__(self, target_path: str, base_ref: Optional[str] = None, config_overrides: Optional[dict] = None,
+                 suppressions: Optional[Dict[str, str]] = None, progress: Optional[ProgressFn] = None,
+                 cache_get=None, cache_set=None):
         self.root = Path(target_path).expanduser().resolve()
-        self.sonar_config, self.codecov_config, self.ghas_config = sonar_config, codecov_config, ghas_config
         self.base_ref = base_ref
         self.config_overrides = config_overrides
-        self.use_ai = use_ai
-        self.baseline = baseline or set()
         self.suppressions = suppressions or {}
-        self.is_remote = is_remote
         self.progress: ProgressFn = progress or (lambda event: None)
         self.cache_get, self.cache_set = cache_get, cache_set
-        self.max_workers = max_workers
 
     def _emit(self, stage: str, message: str, **extra: Any) -> None:
         self.progress({"stage": stage, "message": message, **extra})
 
-    def scanners(self) -> List[Scanner]:
-        return [
-            MavenScanner(), BuildScanner(), SecretsScanner(), PythonLintScanner(), ESLintScanner(), PMDScanner(),
-            TypeCheckScanner(),
-            SemgrepScanner(), BanditScanner(), TrivyScanner(), ComplexityScanner(), DuplicationScanner(),
-            PytestScanner(), HygieneScanner(), SonarQubeScanner(self.sonar_config),
-            CodecovScanner(self.codecov_config), GitHubSecurityScanner(self.ghas_config),
-        ]
-
     def run_full_review(self) -> ReviewResult:
-        started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        started = _now()
         if not self.root.is_dir():
             raise ValueError(f"folder not found: {self.root}")
         clear_line_cache()
-        clear_ast_cache()
         cfg = load_config(self.root, self.config_overrides)
+        ai_cfg = cfg.get("ai") or {}
+        base_ref = (self.base_ref if self.base_ref is not None else cfg.get("base_ref") or "").strip()
+
+        reviewer = AIReviewer(cfg, self.cache_get, self.cache_set)
+        if not reviewer.available:
+            raise ValueError(reviewer.reason)
+
         excludes = exclude_patterns(self.root, cfg)
-
-        self._emit("discover", "Finding source files")
-        files = discover_files(self.root, excludes)
-        languages = detect_languages(files)
-        ctx = ScanContext(root=self.root, config=cfg, files=files, languages=languages,
-                          is_remote=self.is_remote, progress=lambda e: self.progress({"stage": "scan", **e}))
-
-        base_ref = (self.base_ref if self.base_ref is not None else cfg.get("base_ref")) or ""
         if base_ref:
-            self._emit("diff", f"Comparing with {base_ref}")
+            self._emit("diff", f"Finding changes since {base_ref}")
             diff = self._diff(base_ref)
-            added = {p: lines for p, lines in diff.added.items() if not is_excluded(p, excludes)}
-            ctx.changed_lines = {p: set(lines) for p, lines in added.items()}
-            ctx.extra["added_lines"] = added
-            ctx.extra["diff_changed_lines"] = sum(len(v) for v in added.values()) + diff.removed_count
+            added, removed, changed_files = diff.added, diff.removed_count, diff.changed_files
         else:
-            self._emit("diff", "Full project scan (no base_ref provided)")
-            added = {}
-            for f in files:
-                rel = Path(f).relative_to(self.root).as_posix()
-                lines = read_lines(Path(f))
-                added[rel] = {i: text for i, text in enumerate(lines, 1)}
-            ctx.changed_lines = None  # means review all findings from scanners
-            ctx.extra["added_lines"] = added
-            ctx.extra["diff_changed_lines"] = sum(len(v) for v in added.values())
+            self._emit("diff", "Reviewing the whole project (no base branch set)")
+            added = self._whole_project(excludes)
+            removed, changed_files = 0, sorted(added)
+        files, to_review = self._plan(added, excludes, ai_cfg, whole=not base_ref)
+        self._emit("review", f"Reviewing {len(to_review)} changed files with {reviewer.label}", total=len(to_review))
+        for f in files:
+            if f.status == "skipped":
+                self.progress({"stage": "review", "tool": f.path, "status": "skipped", "message": f.message})
 
+        findings: List[Finding] = []
+        by_path = {f.path: f for f in files}
 
-        self._emit("scan", f"Running scanners on {len(files)} files ({', '.join(languages) or 'no code'})")
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            scans: List[ScanResult] = list(pool.map(lambda s: s.run(ctx), self.scanners()))
+        def work(path: str) -> Tuple[str, List[Finding], int, bool, Optional[str]]:
+            self.progress({"stage": "review", "tool": path, "status": "running"})
+            try:
+                issues, chunks, cached = reviewer.review_file(self.root, path, set(added[path]), base_ref)
+                return path, issues, chunks, cached, None
+            except Exception as exc:
+                return path, [], 0, False, f"{type(exc).__name__}: {exc}"
 
-        self._emit("process", "Merging and filtering findings")
-        all_findings = fx.prepare([f for s in scans for f in s.findings], self.root, excludes)
-        fx.apply_inline_suppressions(all_findings, self.root)
-        if ctx.changed_lines is not None:
-            all_findings = fx.filter_to_changes(all_findings, ctx.changed_lines)
-        fx.assign_fingerprints(all_findings, self.root)
-        findings = fx.deduplicate(all_findings)
-        fx.apply_baseline(findings, self.baseline)
+        with ThreadPoolExecutor(max_workers=max(1, int(ai_cfg.get("max_workers", 4)))) as pool:
+            for path, issues, chunks, cached, error in pool.map(work, to_review):
+                review = by_path[path]
+                if error:
+                    review.status, review.message = "error", error[:500]
+                else:
+                    review.status, review.issues, review.chunks, review.cached = "reviewed", len(issues), chunks, cached
+                    findings.extend(issues)
+                self.progress({"stage": "review", "tool": path, "status": review.status,
+                               "message": review.message, "findings": review.issues})
+
+        reviewed = [f for f in files if f.status == "reviewed"]
+        errors = [f for f in files if f.status == "error"]
+        if to_review and not reviewed:
+            raise RuntimeError(f"the AI review failed for every file. First error: {errors[0].message}")
+
+        self._emit("process", "Merging results")
+        findings = fx.deduplicate(findings)
+        fx.attach_context(findings, self.root)
+        fx.assign_fingerprints(findings, self.root)
+        fx.apply_inline_ignores(findings, self.root)
         fx.apply_user_suppressions(findings, self.suppressions)
-
-        scans.append(self._ai_pass(cfg, findings, ctx))
         findings = fx.sort_findings(findings)
-        self._attach_context(findings, cfg)
 
-        self._emit("gates", "Evaluating quality gates")
-        gates = evaluate_gates(findings, scans, cfg, diff_mode=ctx.changed_lines is not None)
-        verdict, reason = decide_verdict(gates, cfg)
-        source_lines = next((s.metrics.get("source_lines") for s in scans if s.metrics.get("source_lines")), None)
-        if source_lines is None:
-            source_lines = sum(len(read_lines(self.root / f)) for f in files if Path(f).suffix.lower() in LANGUAGE_BY_EXT)
-        health = health_score(findings, source_lines, verdict)
+        summary = ""
+        if ai_cfg.get("summary", True) and to_review:
+            self._emit("summary", "Writing the summary")
+            try:
+                summary = reviewer.summarize(base_ref, {p: added[p] for p in to_review},
+                                             [f for f in findings if f.counts])
+            except Exception as exc:
+                summary = f"(summary unavailable: {exc})"
 
+        verdict, label, reason = fx.decide_verdict(findings)
+        if errors:
+            reason += f"; {len(errors)} file{'s' if len(errors) != 1 else ''} couldn't be reviewed"
         stats = {
-            "files": len(files), "source_lines": source_lines, "findings_total": len(findings),
-            "findings_counted": sum(1 for f in findings if f.counts),
-            "suppressed": sum(1 for f in findings if f.suppressed), "baseline": sum(1 for f in findings if not f.is_new),
-            "ai_dismissed": sum(1 for f in findings if f.ai_dismissed),
-            "changed_files": len(ctx.changed_lines) if ctx.changed_lines is not None else None,
+            "scope": "changes" if base_ref else "project",
+            "files_changed": len(changed_files), "files_reviewed": len(reviewed),
+            "files_skipped": sum(1 for f in files if f.status == "skipped"), "files_failed": len(errors),
+            "lines_added": sum(len(added[p]) for p in to_review) if not base_ref else sum(len(v) for v in added.values()),
+            "lines_removed": removed,
+            "issues": sum(1 for f in findings if f.counts), "ignored": sum(1 for f in findings if f.suppressed),
+            "by_severity": fx.counts_by_severity(findings),
+            "requests": sum(f.chunks for f in reviewed), "cached_files": sum(1 for f in reviewed if f.cached),
         }
-        self._emit("done", f"{verdict}: {reason}", verdict=verdict)
+        self._emit("done", f"{label}: {reason}", verdict=verdict)
         return ReviewResult(
-            target=str(self.root), verdict=verdict, verdict_reason=reason, health=health, gates=gates,
-            findings=findings, scans=scans, languages=languages, base_ref=base_ref or None, stats=stats,
-            started_at=started, finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            target=str(self.root), base_ref=base_ref, verdict=verdict, verdict_label=label, verdict_reason=reason,
+            summary=summary, model=reviewer.label, findings=findings, files=files, stats=stats,
+            started_at=started, finished_at=_now(),
         )
 
     # ------------------------------------------------------------------------ #
@@ -153,37 +144,45 @@ class CodeReviewOrchestrator:
                     pass
             raise ValueError(f"can't compare with {base_ref!r}: {first}") from first
 
-    def _ai_pass(self, cfg: Dict[str, Any], findings: List[Finding], ctx: ScanContext) -> ScanResult:
-        reviewer = AIReviewer(cfg, self.cache_get, self.cache_set)
-        if not self.use_ai or not reviewer.available:
-            reason = "AI turned off for this scan" if not self.use_ai else reviewer.reason
-            return ScanResult(tool="AI review", category="ai", status=ScanStatus.SKIPPED, message=reason)
-        self._emit("ai", f"AI triage with {reviewer.provider}/{reviewer.model}")
-        try:
-            metrics = reviewer.triage(findings, self.root, ctx.progress)
-            errors = list(metrics.pop("errors", []))
-            added = ctx.extra.get("added_lines")
-            if added and (cfg.get("ai") or {}).get("file_review", True):
-                self._emit("ai", "AI review of changed files")
-                extra_findings, file_errors = reviewer.review_changes(self.root, added)
-                fx.assign_fingerprints(extra_findings, self.root)
-                fx.apply_user_suppressions(extra_findings, self.suppressions)
-                findings.extend(extra_findings)
-                errors += file_errors
-                metrics["file_review_issues"] = len(extra_findings)
-        except Exception as exc:
-            return ScanResult(tool="AI review", category="ai", status=ScanStatus.ERROR, message=f"{type(exc).__name__}: {exc}")
-        status = ScanStatus.ERROR if errors and not metrics.get("analysed") else ScanStatus.RAN
-        message = f"{reviewer.provider}/{reviewer.model}" + (f"; {len(errors)} errors: {errors[0]}" if errors else "")
-        return ScanResult(tool="AI review", category="ai", status=status, message=message, metrics=metrics)
+    def _whole_project(self, excludes: List[str]) -> Dict[str, Dict[int, str]]:
+        """Every reviewable file, with all its lines in scope."""
+        added: Dict[str, Dict[int, str]] = {}
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            rel_dir = Path(dirpath).relative_to(self.root).as_posix()
+            rel_dir = "" if rel_dir == "." else rel_dir
+            dirnames[:] = sorted(d for d in dirnames if not is_excluded(f"{rel_dir}/{d}".strip("/"), excludes))
+            for name in sorted(filenames):
+                rel = f"{rel_dir}/{name}".strip("/")
+                if is_excluded(rel, excludes) or not language_of(rel):
+                    continue
+                lines = read_lines(self.root / rel)
+                if any(text.strip() for text in lines):
+                    added[rel] = {i: text for i, text in enumerate(lines, 1)}
+        return added
 
-    def _attach_context(self, findings: List[Finding], cfg: Dict[str, Any]) -> None:
-        window = int((cfg.get("ai") or {}).get("context_lines", 20))
-        for f in findings[:MAX_CONTEXT_FINDINGS]:
-            if f.context is None and f.line > 0 and f.category not in (Category.DEPENDENCIES, Category.EXTERNAL):
-                code, start = extract_context(self.root, f, window)
-                if code:
-                    f.context, f.context_start = code, start
+    def _plan(self, added: Dict[str, Dict[int, str]], excludes: List[str], ai_cfg: Dict[str, Any],
+              whole: bool = False) -> Tuple[List[FileReview], List[str]]:
+        max_files = int(ai_cfg.get("max_files", 80))
+        too_big = int(ai_cfg.get("skip_files_with_more_changed_lines_than", 3000))
+        files: List[FileReview] = []
+        to_review: List[str] = []
+        for path in sorted(added):
+            lines = added[path]
+            review = FileReview(path=path, status="pending", lines_added=len(lines))
+            if not lines:
+                review.status, review.message = "skipped", "only deletions"
+            elif is_excluded(path, excludes):
+                review.status, review.message = "skipped", "excluded (reviewer.yml or .reviewerignore)"
+            elif not language_of(path):
+                review.status, review.message = "skipped", "not a source or config file"
+            elif len(lines) > too_big:
+                review.status, review.message = "skipped", f"{len(lines)} {'lines' if whole else 'changed lines'}; too large to review"
+            elif len(to_review) >= max_files:
+                review.status, review.message = "skipped", f"limit of {max_files} files per scan (ai.max_files)"
+            else:
+                to_review.append(path)
+            files.append(review)
+        return files, to_review
 
 
 def validate_github_url(url: str) -> str:
@@ -193,7 +192,8 @@ def validate_github_url(url: str) -> str:
     return url
 
 
-def clone_github_repo(repo_url: str, project_id: str, full_history: bool = False) -> str:
+def clone_github_repo(repo_url: str, project_id: str) -> str:
+    """Clone with full history (but no file contents up front) so the base branch can be compared."""
     url = validate_github_url(repo_url)
     if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", project_id or ""):
         raise ValueError("invalid project id")
@@ -204,8 +204,9 @@ def clone_github_repo(repo_url: str, project_id: str, full_history: bool = False
         raise ValueError("refusing to clone outside the clone folder")
     if dest.exists():
         shutil.rmtree(dest)
-    cmd = ["git", "clone", "--filter=blob:none" if full_history else "--depth=1", "--", url, str(dest)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
+    proc = subprocess.run(["git", "clone", "--filter=blob:none", "--no-single-branch", "--", url, str(dest)],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
     if proc.returncode != 0:
         raise RuntimeError(f"git clone failed: {proc.stderr.strip()[:500]}")
     return str(dest)
+

@@ -31,8 +31,8 @@ REVIEW_SYSTEM = (
     "see in the code shown. If the change looks correct, return no issues. Reply with one JSON object only."
 )
 
-REVIEW_TEMPLATE = """Change: {path} ({language}), compared with {base_ref}.
-{part}Lines starting with + were added or changed. "..." separates sections that are not next to each other.
+REVIEW_TEMPLATE = """{intro}
+{part}Lines starting with + are the ones to review; other lines are context. "..." separates sections that are not next to each other.
 
 ```
 {code}
@@ -55,10 +55,10 @@ Return JSON:
 Severity guide: CRITICAL = security hole or data loss; HIGH = bug that will hit users; MEDIUM = likely problem or risky code; LOW = minor improvement."""
 
 SUMMARY_SYSTEM = "You summarise code changes for a reviewer. Plain, specific, no marketing language. Reply with one JSON object only."
-SUMMARY_TEMPLATE = """Files changed (compared with {base_ref}):
+SUMMARY_TEMPLATE = """{heading}:
 {files}
 
-Excerpts of the added code:
+Excerpts of the code:
 ```
 {excerpt}
 ```
@@ -66,7 +66,7 @@ Excerpts of the added code:
 Issues found by the review:
 {issues}
 
-Return JSON: {{"summary": "2-4 sentences: what this change does, and the main risks a reviewer should look at"}}"""
+Return JSON: {{"summary": "2-4 sentences: {ask}, and the main risks a reviewer should look at"}}"""
 
 
 # --------------------------------------------------------------------------- #
@@ -244,7 +244,9 @@ class AIReviewer:
         all_cached = True
         for i, numbers in enumerate(chunks):
             part = f"Part {i + 1} of {len(chunks)} of this file. " if len(chunks) > 1 else ""
-            prompt = REVIEW_TEMPLATE.format(path=rel, language=language, base_ref=base_ref, part=part,
+            intro = (f"Change: {rel} ({language}), compared with {base_ref}." if base_ref else
+                     f"File: {rel} ({language}). Whole-file review of existing code: every line is in scope.")
+            prompt = REVIEW_TEMPLATE.format(intro=intro, part=part,
                                             code=render_chunk(lines, numbers, changed), focus=focus,
                                             categories=" | ".join(f'"{c}"' for c in CATEGORIES))
             data, cached = self.complete_json(REVIEW_SYSTEM, prompt)
@@ -291,5 +293,7 @@ class AIReviewer:
                 break
         issues = "\n".join(f"- {f.severity.value} {f.file_path}:{f.line} {f.title}" for f in findings[:40]) or "- none"
         data, _ = self.complete_json(SUMMARY_SYSTEM, SUMMARY_TEMPLATE.format(
-            base_ref=base_ref, files=files, excerpt="\n".join(excerpt_lines[:300]), issues=issues))
+            heading=f"Files changed (compared with {base_ref})" if base_ref else "Files reviewed (whole project)",
+            ask="what this change does" if base_ref else "what this code does",
+            files=files, excerpt="\n".join(excerpt_lines[:300]), issues=issues))
         return str(data.get("summary") or "").strip()

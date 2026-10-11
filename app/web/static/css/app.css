@@ -470,3 +470,31 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
   .log-table .opt { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* ------------------------------------------------------------------ AI review */
+.ai-status { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; color: var(--text-2); line-height: 1.4; }
+.ai-status .dot { margin-top: 4px; }
+.verdict-value { font-size: 28px; }
+.change-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 4px 0 10px; }
+.change-stats div { display: flex; flex-direction: column; }
+.change-stats b { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.change-stats span { font-size: 12px; color: var(--text-3); }
+.c-add { color: var(--pass); }
+.c-del { color: var(--fail); }
+.summary-card .section-head { margin-bottom: 6px; }
+.summary-card h2 { display: flex; align-items: center; gap: 4px; }
+.summary-text { margin: 0; font-size: 14.5px; line-height: 1.6; color: var(--text); max-width: 110ch; }
+#filesTable { grid-template-columns: minmax(0, 2.2fr) auto auto auto minmax(0, 1.4fr); }
+.file-link { display: flex; align-items: center; gap: 8px; min-width: 0; background: none; border: 0; padding: 2px 4px; margin: 0 -4px;
+  border-radius: 6px; cursor: pointer; text-align: left; font: 500 12.5px var(--mono); color: var(--text); }
+.file-link bdi { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-link:hover { background: var(--surface-2); }
+.file-link.active { background: var(--accent-soft); }
+.detail-meta .link-btn { margin-left: auto; }
+.ai-box { margin-top: 4px; font-size: 14px; line-height: 1.55; }
+.detail-tags .conf { margin-left: auto; }
+.stepper { grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 600px) { #filesTable { grid-template-columns: minmax(0, 1fr) auto auto; } #filesTable > :nth-child(5n), #filesTable > :nth-child(5n+3) { display: none; } }
+.explorer > *, .summary > *, .content > * { min-width: 0; }
+.detail-meta .mono, .detail-title { overflow-wrap: anywhere; min-width: 0; }
+.detail-tags { flex-wrap: wrap; }

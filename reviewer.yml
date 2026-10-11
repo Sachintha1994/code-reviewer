@@ -16,7 +16,7 @@ ai:
   context_lines: 25         # unchanged lines shown around each changed section
   skip_files_with_more_changed_lines_than: 3000
   min_confidence: 0.5       # issues the AI is less sure about are dropped
-  max_workers: 1            # AI requests sent in parallel
+  max_workers: 4            # AI requests sent in parallel
   summary: true             # write a short summary of the whole change
   # What to look for. Edit to match your team's standards.
   focus:

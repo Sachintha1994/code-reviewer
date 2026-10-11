@@ -1,11 +1,12 @@
-"""Command-line entry point.
+"""Command line: AI code review of a project, or of its changes since a branch.
 
-    python main.py path/to/project                 review the whole project
-    python main.py path/to/project --base main     review only changes since main
-    python main.py path/to/project --json out.json --no-ai
+    python main.py C:\\path\\to\\project --base main      changes since main
+    python main.py C:\\path\\to\\project                  the whole project
+    python main.py C:\\path\\to\\project --base pm-dev --json review.json
 
-Exit code: 0 for PASS or WARN, 1 for FAIL, 2 for errors (use --strict to fail on WARN too).
-The dashboard is started separately:  uvicorn app.web_dashboard:app --reload
+Exit code: 0 when the review passes or has only comments, 1 when changes are
+requested (use --strict to also fail on comments), 2 on errors.
+The dashboard is started separately:  python -m uvicorn app.web_dashboard:app --reload
 """
 from __future__ import annotations
 
@@ -13,55 +14,50 @@ import argparse
 import json
 import sys
 
-from app.core.orchestrator import CodeReviewOrchestrator, clone_github_repo  # noqa: F401 (re-exported)
-
-ICONS = {"passed": "PASS", "failed": "FAIL", "skipped": "SKIP"}
+from app.core.orchestrator import CodeReviewOrchestrator
 
 
 def print_report(result) -> None:
     print()
-    print(f"Verdict: {result.verdict}  ({result.verdict_reason})")
-    h = result.health
-    print(f"Health:  {h['score']}/100, grade {h['grade']}  ({h['density']} weighted findings per 1,000 lines)")
+    print(f"{result.verdict_label}: {result.verdict_reason}")
+    s = result.stats
+    scope = f"changes since {result.base_ref}" if result.base_ref else "whole project"
+    print(f"{s['files_reviewed']} files reviewed ({scope}, {s['lines_added']} lines) with {result.model}")
+    if result.summary:
+        print()
+        print(result.summary)
+    active = [f for f in result.findings if f.counts]
     print()
-    print("Gates:")
-    for g in result.gates:
-        actual = f" {g.actual}" if g.actual else ""
-        detail = f" - {g.details}" if g.details else ""
-        print(f"  [{ICONS[g.status.value]}] {g.name:<28}{actual}{detail}  ({g.severity})")
-    counted = [f for f in result.findings if f.counts]
-    print()
-    print(f"Findings: {len(counted)} counted, {len(result.findings) - len(counted)} suppressed/dismissed/baseline")
-    for f in counted[:25]:
-        sev = f.effective_severity.value
-        print(f"  {sev:<8} {f.file_path}:{f.line}  [{', '.join(f.tools)}] {f.rule_id}: {f.message[:110]}")
-    if len(counted) > 25:
-        print(f"  ... {len(counted) - 25} more (use --json to see all)")
+    print(f"Issues: {len(active)}" + (f" ({s['ignored']} ignored)" if s.get("ignored") else ""))
+    for f in active:
+        print(f"  {f.severity.value:<8} {f.file_path}:{f.line}  [{f.category}] {f.title}")
+    failed = [f for f in result.files if f.status == "error"]
+    for f in failed:
+        print(f"  couldn't review {f.path}: {f.message}")
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Run the code reviewer on a folder.")
-    parser.add_argument("path", help="project folder to review")
-    parser.add_argument("--base", default=None, help="git ref to compare against; only changed lines are reviewed")
+    parser = argparse.ArgumentParser(description="AI code review of a project, or of its changes since a branch.")
+    parser.add_argument("path", help="project folder (a git repository)")
+    parser.add_argument("--base", default=None,
+                        help="branch to compare with, e.g. main. Without it (and no base_ref in reviewer.yml) the whole project is reviewed")
     parser.add_argument("--json", dest="json_out", help="write the full result to this JSON file")
-    parser.add_argument("--no-ai", action="store_true", help="skip the AI triage")
-    parser.add_argument("--strict", action="store_true", help="exit 1 on WARN as well as FAIL")
-    parser.add_argument("--quiet", action="store_true", help="don't print scanner progress")
+    parser.add_argument("--strict", action="store_true", help="exit 1 on medium issues as well")
+    parser.add_argument("--quiet", action="store_true", help="don't print progress")
     args = parser.parse_args(argv)
 
     def progress(event):
         if args.quiet:
             return
-        if event.get("tool"):
-            if event.get("status") != "running" or event.get("tool") == "AI triage":
-                print(f"  {event['tool']:<18} {event.get('status', ''):<8} {event.get('message', '')}", file=sys.stderr)
-        elif event.get("message"):
+        if event.get("tool") and event.get("status") != "running":
+            extra = f"{event.get('findings', 0)} issues" if event.get("status") == "reviewed" else event.get("message", "")
+            print(f"  {event['status']:<9} {event['tool']}  {extra}", file=sys.stderr)
+        elif not event.get("tool") and event.get("message"):
             print(f"- {event['message']}", file=sys.stderr)
 
     try:
-        result = CodeReviewOrchestrator(args.path, base_ref=args.base, use_ai=not args.no_ai,
-                                        progress=progress).run_full_review()
-    except ValueError as exc:
+        result = CodeReviewOrchestrator(args.path, base_ref=args.base, progress=progress).run_full_review()
+    except (ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     print_report(result)

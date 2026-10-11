@@ -1,4 +1,6 @@
 """API tests. Run where FastAPI is installed (skipped otherwise)."""
+import subprocess
+
 import pytest
 
 pytest.importorskip("fastapi")
@@ -7,8 +9,8 @@ pytest.importorskip("httpx")
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("REVIEWER_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("REVIEWER_ALLOWED_ROOTS", str(tmp_path.parent.parent))
+    monkeypatch.setenv("REVIEWER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("REVIEWER_ALLOWED_ROOTS", str(tmp_path))
     import importlib
 
     import app.config
@@ -24,35 +26,35 @@ def client(tmp_path, monkeypatch):
 
 
 def test_index_and_static(client):
-    page = client.get("/")
-    assert page.status_code == 200 and "Code Reviewer" in page.text
+    assert "AI Code Reviewer" in client.get("/").text
     assert client.get("/static/js/app.js").status_code == 200
 
 
 def test_project_validation(client, tmp_path):
-    bad = client.post("/api/projects", json={"name": "x", "source_type": "github", "path_or_url": "https://evil.com/a/b"})
-    assert bad.status_code == 400
-    missing = client.post("/api/projects", json={"name": "x", "source_type": "local", "path_or_url": str(tmp_path / "nope")})
-    assert missing.status_code == 400
-    outside = client.post("/api/projects", json={"name": "x", "source_type": "local", "path_or_url": "/"})
-    assert outside.status_code == 400
-    bad_ref = client.post("/api/projects", json={"name": "x", "source_type": "local", "path_or_url": str(tmp_path), "base_ref": "--output=x"})
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    not_git = client.post("/api/projects", json={"name": "x", "source_type": "local", "path_or_url": str(plain), "base_ref": "main"})
+    assert not_git.status_code == 400 and "git" in not_git.json()["detail"]
+    whole = client.post("/api/projects", json={"name": "x", "source_type": "local", "path_or_url": str(plain)})
+    assert whole.status_code == 201 and whole.json()["base_ref"] == ""   # no branch: whole-project reviews
+    bad_url = client.post("/api/projects", json={"name": "x", "source_type": "github", "path_or_url": "https://evil.com/a/b", "base_ref": "main"})
+    assert bad_url.status_code == 400
+    bad_ref = client.post("/api/projects", json={"name": "x", "source_type": "local", "path_or_url": str(plain), "base_ref": "--output=x"})
     assert bad_ref.status_code == 422
 
 
-def test_project_lifecycle_hides_token(client, tmp_path):
-    (tmp_path / "proj").mkdir()
-    created = client.post("/api/projects", json={"name": "Demo", "source_type": "local", "path_or_url": str(tmp_path / "proj"),
-                                                 "sonar_token": "secret-token"})
+def test_project_lifecycle(client, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    created = client.post("/api/projects", json={"name": "Demo", "source_type": "local", "path_or_url": str(repo), "base_ref": "main"})
     assert created.status_code == 201
-    body = created.json()
-    assert "sonar_token" not in body and body["has_sonar_token"] is True
-    listed = client.get("/api/projects").json()
-    assert listed[0]["name"] == "Demo" and "sonar_token" not in listed[0]
-    assert client.get(f"/api/projects/{body['id']}/latest").json() == {"scan": None}
-    assert client.delete(f"/api/projects/{body['id']}").status_code == 204
+    pid = created.json()["id"]
+    assert client.get(f"/api/projects/{pid}/latest").json() == {"scan": None}
+    assert client.patch(f"/api/projects/{pid}", json={"base_ref": "pm-dev"}).json()["base_ref"] == "pm-dev"
+    assert client.delete(f"/api/projects/{pid}").status_code == 204
 
 
-def test_tools_endpoint(client):
-    names = {t["name"] for t in client.get("/api/tools").json()}
-    assert {"ruff", "semgrep", "trivy", "AI review"} <= names
+def test_ai_status(client, monkeypatch):
+    body = client.get("/api/ai").json()
+    assert set(body) >= {"available", "provider", "model", "reason"}

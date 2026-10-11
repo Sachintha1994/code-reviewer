@@ -84,8 +84,6 @@ def test_requires_base_and_ai(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="GEMINI_API_KEY"):
         CodeReviewOrchestrator(str(repo), base_ref="base").run_full_review()
     fake_ai(monkeypatch, [])
-    with pytest.raises(ValueError, match="branch"):
-        CodeReviewOrchestrator(str(repo), base_ref="").run_full_review()
     with pytest.raises(ValueError, match="can't compare"):
         CodeReviewOrchestrator(str(repo), base_ref="nope").run_full_review()
 
@@ -227,3 +225,22 @@ def test_json_mode_falls_back_when_rejected(monkeypatch):
     assert r.complete_json("s", "u") == ({"issues": []}, False)
     assert r.complete_json("s", "u2")[0] == {"issues": []}
     assert seen == [True, False, False]   # JSON mode is tried once, then skipped
+
+
+def test_whole_project_review_without_base(tmp_path, monkeypatch):
+    calls = fake_ai(monkeypatch, [
+        {"line": 2, "severity": "MEDIUM", "category": "bug", "title": "Field never set", "confidence": 0.8},
+    ])
+    repo = tmp_path / "plain"          # not a git repository
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "A.java").write_text("class A {\n    String user;\n}\n")
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "x.js").write_text("var a = 1;\n")
+    (repo / "notes.md").write_text("hello\n")
+    result = CodeReviewOrchestrator(str(repo), base_ref="").run_full_review()
+    assert result.base_ref == "" and result.stats["scope"] == "project"
+    assert [f.path for f in result.files] == ["src/A.java"]           # excluded and non-source files left out
+    assert [f.title for f in result.findings] == ["Field never set"]   # every line is in scope
+    assert result.verdict == "WARN"
+    assert "Whole-file review" in calls[0] and "+    1 | class A {" in calls[0]
+    assert "whole project" in calls[-1]

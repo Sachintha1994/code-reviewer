@@ -1,2 +1,0 @@
-requests==2.19.0
-flask==0.12

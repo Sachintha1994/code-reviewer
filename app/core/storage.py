@@ -1,4 +1,4 @@
-"""SQLite storage for projects, scan history, suppressions, baselines and the AI cache."""
+"""SQLite storage for projects, scan history, ignored findings and the AI cache."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from app.config import DATA_DIR
 
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS baselines (
 CREATE TABLE IF NOT EXISTS ai_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at TEXT NOT NULL);
 """
 
-PROJECT_FIELDS = ("name", "source_type", "path_or_url", "base_ref", "sonar_host", "sonar_token", "sonar_project_key")
+PROJECT_FIELDS = ("name", "source_type", "path_or_url", "base_ref")
 
 
 def now() -> str:
@@ -93,7 +93,7 @@ class Storage:
             ORDER BY p.created_at""")
 
     def delete_project(self, pid: str) -> None:
-        for table in ("scans", "suppressions", "baselines"):
+        for table in ("scans", "suppressions"):
             self._exec(f"DELETE FROM {table} WHERE project_id=?", (pid,))
         self._exec("DELETE FROM projects WHERE id=?", (pid,))
 
@@ -148,19 +148,6 @@ class Storage:
         rows = self._all("SELECT fingerprint, kind, reason FROM suppressions WHERE project_id=?", (project_id,))
         labels = {"false_positive": "marked false positive", "ignore": "ignored"}
         return {r["fingerprint"]: f"{labels.get(r['kind'], r['kind'])}{': ' + r['reason'] if r['reason'] else ''}" for r in rows}
-
-    def set_baseline(self, project_id: str, fingerprints: Set[str]) -> int:
-        with self._lock:
-            self._conn.execute("DELETE FROM baselines WHERE project_id=?", (project_id,))
-            self._conn.executemany("INSERT OR IGNORE INTO baselines VALUES (?, ?)", [(project_id, fp) for fp in fingerprints])
-            self._conn.commit()
-        return len(fingerprints)
-
-    def clear_baseline(self, project_id: str) -> None:
-        self._exec("DELETE FROM baselines WHERE project_id=?", (project_id,))
-
-    def baseline(self, project_id: str) -> Set[str]:
-        return {r["fingerprint"] for r in self._all("SELECT fingerprint FROM baselines WHERE project_id=?", (project_id,))}
 
     # AI cache ------------------------------------------------------------------ #
     def cache_get(self, key: str) -> Optional[str]:

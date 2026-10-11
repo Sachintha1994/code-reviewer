@@ -17,127 +17,62 @@ class Severity(str, Enum):
     def rank(self) -> int:
         return {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}[self.value]
 
-    def lower(self, steps: int = 1) -> "Severity":
-        order = [Severity.INFO, Severity.LOW, Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL]
-        return order[max(0, self.rank - steps)]
-
     @classmethod
     def parse(cls, value: Any, default: Optional["Severity"] = None) -> "Severity":
         try:
             return cls(str(value).upper().strip())
         except ValueError:
-            return default or cls.INFO
+            return default or cls.LOW
 
 
-class Category(str, Enum):
-    BUILD = "build"
-    TESTS = "tests"
-    SECRETS = "secrets"
-    SAST = "sast"
-    DEPENDENCIES = "dependencies"
-    LINT = "lint"
-    TYPES = "types"
-    COMPLEXITY = "complexity"
-    SIZE = "size"
-    DUPLICATION = "duplication"
-    DEBUG = "debug"
-    AI = "ai"
-    EXTERNAL = "external"
+CATEGORIES = ("bug", "security", "performance", "reliability", "maintainability", "testing", "style")
 
 
 class Finding(BaseModel):
-    tool: str = Field(..., description="Tool that reported the issue")
-    rule_id: str = Field(..., description="Rule or check identifier, e.g. F821, B608, CVE-2024-1234")
-    file_path: str = Field(..., description="Path relative to the project root, forward slashes")
-    line: int = 0
-    column: Optional[int] = None
+    """One issue the AI found in the changed code."""
+    file_path: str                            # relative to the project root, forward slashes
+    line: int
     end_line: Optional[int] = None
-    message: str
     severity: Severity
-    category: Category = Category.LINT
-    code_snippet: Optional[str] = None
-    confidence: Optional[str] = None          # scanner's own confidence, if it reports one
-    url: Optional[str] = None                 # rule documentation
-    tools: List[str] = Field(default_factory=list)  # every tool that reported it (after de-duplication)
-    fingerprint: str = ""
-    is_new: bool = True                       # False when the finding is in the project's baseline
-    suppressed: Optional[str] = None          # reason, when ignored inline or by a user
-    # Source shown to the AI and in the dashboard
-    context: Optional[str] = None
+    category: str = "bug"
+    title: str
+    explanation: str = ""
+    confidence: float = 0.5
+    fix: Optional[str] = None                 # replacement for lines line..end_line
+    context: Optional[str] = None             # the original code those lines (plus a little around them)
     context_start: Optional[int] = None
     language: Optional[str] = None
-    # AI triage
-    ai_verdict: Optional[str] = None          # TRUE_POSITIVE | FALSE_POSITIVE | UNSURE
-    ai_confidence: Optional[float] = None
-    ai_severity: Optional[Severity] = None
-    ai_explanation: Optional[str] = None
-    ai_fix: Optional[str] = None
-    ai_dismissed: bool = False
-    extra: Dict[str, Any] = Field(default_factory=dict)
-
-    @property
-    def effective_severity(self) -> Severity:
-        return self.ai_severity or self.severity
+    fingerprint: str = ""
+    suppressed: Optional[str] = None          # reason, when ignored inline or by a user
 
     @property
     def counts(self) -> bool:
-        """Whether the finding takes part in gates and the score."""
-        return self.is_new and not self.suppressed and not self.ai_dismissed
+        return not self.suppressed
 
 
-class ScanStatus(str, Enum):
-    RAN = "ran"
-    SKIPPED = "skipped"
-    ERROR = "error"
-
-
-class ScanResult(BaseModel):
-    tool: str
-    category: str
-    status: ScanStatus
+class FileReview(BaseModel):
+    path: str
+    status: str                               # reviewed | skipped | error
     message: str = ""
-    findings: List[Finding] = Field(default_factory=list)
-    metrics: Dict[str, Any] = Field(default_factory=dict)
-    duration_seconds: float = 0.0
-    not_applicable: bool = False          # skipped because the project doesn't need it (not a missing tool)
-
-
-class GateStatus(str, Enum):
-    PASSED = "passed"
-    FAILED = "failed"
-    SKIPPED = "skipped"
-
-
-class GateResult(BaseModel):
-    key: str
-    name: str
-    status: GateStatus
-    severity: str                         # blocker | warn
-    actual: Optional[str] = None
-    threshold: Optional[str] = None
-    details: str = ""
-    tools: List[str] = Field(default_factory=list)
-    not_applicable: bool = False
-    top_files: List[Dict[str, Any]] = Field(default_factory=list)
+    lines_added: int = 0
+    issues: int = 0
+    chunks: int = 0
+    cached: bool = False
 
 
 class ReviewResult(BaseModel):
     target: str
-    verdict: str
+    base_ref: str                             # empty for a whole-project review
+    verdict: str                              # PASS | WARN | FAIL
+    verdict_label: str                        # Looks good | Approve with comments | Changes requested
     verdict_reason: str
-    health: Dict[str, Any]
-    gates: List[GateResult]
+    summary: str = ""
+    model: str = ""
     findings: List[Finding]
-    scans: List[ScanResult]
-    languages: List[str] = Field(default_factory=list)
-    base_ref: Optional[str] = None
+    files: List[FileReview]
     stats: Dict[str, Any] = Field(default_factory=dict)
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        data = self.model_dump(mode="json")
-        # Each scan's findings are already in the top-level list; keep only the count.
-        for scan in data["scans"]:
-            scan["finding_count"] = len(scan.pop("findings", []))
-        return data
+        return self.model_dump(mode="json")

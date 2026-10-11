@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Code Reviewer</title>
+  <title>AI Code Reviewer</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Cpath d='M11 11l-5 5 5 5M21 11l5 5-5 5M18 8l-4 16' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
@@ -50,16 +50,16 @@
     <!-- Sidebar -->
     <aside class="sidebar" id="sidebar" aria-label="Projects">
       <div class="brand">
-        <span class="brand-mark" aria-hidden="true"><svg><use href="#i-file"/></svg></span>
-        <span class="brand-name">Code Reviewer</span>
+        <span class="brand-mark" aria-hidden="true"><svg><use href="#i-sparkle"/></svg></span>
+        <span class="brand-name">AI Code Reviewer</span>
         <button class="icon-btn only-mobile" id="closeSidebar" aria-label="Close menu"><svg><use href="#i-x"/></svg></button>
       </div>
       <button class="btn btn-dashed w-full" id="addProjectBtn"><svg><use href="#i-plus"/></svg>Add project</button>
       <div class="sidebar-label">Projects</div>
       <nav id="projectList" class="project-list"></nav>
       <div class="sidebar-foot">
-        <button class="link-btn" id="toolsBtn"><svg><use href="#i-tool"/></svg>Installed tools</button>
-        <div class="legend"><span class="dot dot-fail"></span>fail <span class="dot dot-warn"></span>warn <span class="dot dot-pass"></span>pass</div>
+        <div class="ai-status" id="aiStatus"></div>
+        <div class="legend"><span class="dot dot-fail"></span>changes <span class="dot dot-warn"></span>comments <span class="dot dot-pass"></span>good</div>
       </div>
     </aside>
     <div class="scrim" id="scrim" hidden></div>
@@ -76,15 +76,15 @@
           <button class="btn btn-ghost hide-sm" id="settingsBtn" hidden>Settings</button>
           <button class="btn btn-ghost" id="pdfBtn" hidden><svg><use href="#i-file"/></svg><span class="hide-sm">Export PDF</span></button>
           <div class="run-group" id="runGroup" hidden>
-            <button class="btn btn-primary" id="runBtn" aria-label="Run scan"><svg><use href="#i-play"/></svg><span class="hide-sm">Run scan</span></button>
-            <button class="btn btn-primary btn-caret" id="runOptionsBtn" aria-label="Scan options" aria-expanded="false"><svg><use href="#i-chevron"/></svg></button>
+            <button class="btn btn-primary" id="runBtn" aria-label="Run review"><svg><use href="#i-sparkle"/></svg><span class="hide-sm">Run review</span></button>
+            <button class="btn btn-primary btn-caret" id="runOptionsBtn" aria-label="Review options" aria-expanded="false"><svg><use href="#i-chevron"/></svg></button>
             <div class="popover" id="runOptions" hidden>
               <label class="field">
-                <span>Compare with branch <em>(optional)</em></span>
-                <input id="scanBaseRef" placeholder="e.g. main — empty reviews everything" autocomplete="off">
+                <span>Compare with branch</span>
+                <input id="scanBaseRef" placeholder="e.g. main" autocomplete="off">
               </label>
-              <label class="check"><input type="checkbox" id="scanUseAi" checked> AI triage of findings</label>
-              <button class="btn btn-primary w-full" id="runWithOptions">Run with these options</button>
+              <button class="btn btn-primary w-full" id="runWithOptions">Review changes since this branch</button>
+              <button class="btn btn-ghost w-full" id="runWholeProject">Review the whole project</button>
             </div>
           </div>
           <button class="icon-btn" id="themeBtn" aria-label="Toggle dark mode"><svg><use href="#i-moon"/></svg></button>
@@ -92,39 +92,34 @@
       </header>
 
       <section class="content" id="content">
-        <!-- Empty state -->
         <div class="empty" id="welcome">
-          <div class="empty-art" aria-hidden="true"><svg><use href="#i-layers"/></svg></div>
-          <h2>Review a codebase in one click</h2>
-          <p>Add a local folder or a GitHub repository. The reviewer runs security, quality and dependency
-            checks, asks AI to weed out false positives, and tells you whether the code can ship.</p>
+          <div class="empty-art" aria-hidden="true"><svg><use href="#i-sparkle"/></svg></div>
+          <h2>AI review of your changes</h2>
+          <p>Add a project and, optionally, a branch to compare with. The AI reviews the code you changed,
+            like a senior engineer on a pull request, or the whole project, and suggests fixes.</p>
           <button class="btn btn-primary" id="welcomeAdd"><svg><use href="#i-plus"/></svg>Add your first project</button>
         </div>
 
-        <!-- Progress -->
         <div class="card progress-card" id="progressCard" hidden>
           <div class="progress-head">
             <div class="spinner" aria-hidden="true"></div>
-            <div><strong id="progressTitle">Scanning…</strong><div class="muted small" id="progressMsg"></div></div>
+            <div><strong id="progressTitle">Reviewing…</strong><div class="muted small" id="progressMsg"></div></div>
           </div>
           <ol class="stepper" id="stepper"></ol>
           <div class="tool-grid" id="toolGrid"></div>
         </div>
 
-        <!-- No scan yet -->
         <div class="empty" id="noScan" hidden>
-          <h2>No scan yet</h2>
-          <p>Run the first scan to see the verdict, quality gates and findings for this project.</p>
-          <button class="btn btn-primary" id="noScanRun"><svg><use href="#i-play"/></svg>Run first scan</button>
+          <h2 id="noScanTitle">No review yet</h2>
+          <p id="noScanText">Run the first review to see what the AI finds in your changes.</p>
+          <button class="btn btn-primary" id="noScanRun"><svg><use href="#i-sparkle"/></svg>Run review</button>
         </div>
 
-        <!-- Error -->
         <div class="card error-card" id="errorCard" hidden>
-          <strong>The last scan failed</strong>
+          <strong>The last review failed</strong>
           <pre id="errorText"></pre>
         </div>
 
-        <!-- Results -->
         <div id="results" hidden>
           <div class="summary">
             <article class="card verdict-card" id="verdictCard">
@@ -133,81 +128,62 @@
               <div class="verdict-reason" id="verdictReason"></div>
               <div class="verdict-foot muted small" id="verdictFoot"></div>
             </article>
-            <article class="card health-card">
-              <div class="card-label">Health score</div>
-              <div class="health-body">
-                <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
-                  <circle class="ring-track" cx="60" cy="60" r="50"/>
-                  <circle class="ring-value" id="ringValue" cx="60" cy="60" r="50"/>
-                </svg>
-                <div class="ring-label"><span id="scoreValue">—</span><small id="gradeValue"></small></div>
-                <div class="health-side">
-                  <div id="scoreDelta" class="delta"></div>
-                  <div class="muted small" id="densityText"></div>
-                </div>
+            <article class="card change-card">
+              <div class="card-label">Change</div>
+              <div class="change-stats">
+                <div><b id="statFiles">0</b><span>files reviewed</span></div>
+                <div><b class="c-add" id="statAdded">+0</b><span>lines added</span></div>
+                <div><b class="c-del" id="statRemoved">−0</b><span>lines removed</span></div>
               </div>
+              <div class="muted small" id="changeFoot"></div>
             </article>
             <article class="card severity-card">
-              <div class="card-label">Severity mix <span class="muted small">(click to filter)</span></div>
+              <div class="card-label">Issues by severity <span class="muted small">(click to filter)</span></div>
               <div class="sev-counts" id="sevCounts"></div>
               <div class="sev-bar" id="sevBar" aria-hidden="true"></div>
             </article>
           </div>
 
-          <section class="card gates-card">
+          <section class="card summary-card" id="summaryCard">
             <div class="section-head">
-              <h2>Quality gates</h2>
-              <div class="legend"><span class="dot dot-pass"></span>pass <span class="dot dot-fail"></span>fail
-                <span class="dot dot-warn"></span>warn <span class="dot dot-skip"></span>skipped</div>
+              <h2><svg class="inline"><use href="#i-sparkle"/></svg>AI summary</h2>
+              <span class="muted small" id="modelLabel"></span>
             </div>
-            <div class="gates" id="gates"></div>
-          </section>
-
-          <section class="charts">
-            <article class="card chart-card">
-              <div class="card-label">Health over time</div>
-              <div class="chart-wrap" id="trendChart"></div>
-            </article>
-            <article class="card chart-card">
-              <div class="card-label">Findings by tool</div>
-              <div class="chart-wrap" id="toolChart"></div>
-            </article>
+            <p id="summaryText" class="summary-text"></p>
           </section>
 
           <section class="explorer">
             <div class="card findings-card">
               <div class="section-head">
-                <h2>Findings <span class="count" id="findingCount"></span></h2>
-                <button class="link-btn small" id="baselineBtn" title="Treat everything found now as existing, and only report new issues from here on">Set baseline</button>
+                <h2>Issues <span class="count" id="findingCount"></span></h2>
               </div>
               <div class="filters">
-                <div class="search"><svg><use href="#i-search"/></svg><input id="searchInput" placeholder="Search message, file or rule" autocomplete="off"></div>
+                <div class="search"><svg><use href="#i-search"/></svg><input id="searchInput" placeholder="Search title, file or explanation" autocomplete="off"></div>
                 <div class="filter-row">
                   <div class="chips" id="sevFilter" role="group" aria-label="Severity"></div>
-                  <select id="toolFilter" aria-label="Tool"><option value="">All tools</option></select>
                   <select id="catFilter" aria-label="Category"><option value="">All categories</option></select>
                 </div>
                 <div class="filter-row">
-                  <label class="check small"><input type="checkbox" id="aiOnly"> AI-confirmed only</label>
-                  <label class="check small"><input type="checkbox" id="showHidden"> Show ignored, baseline &amp; AI-dismissed <span id="hiddenCount"></span></label>
+                  <label class="check small"><input type="checkbox" id="fixOnly"> With a suggested fix</label>
+                  <label class="check small"><input type="checkbox" id="showHidden"> Show ignored <span id="hiddenCount"></span></label>
                   <button class="link-btn small" id="clearFilters">Clear filters</button>
                 </div>
               </div>
-              <div class="finding-list" id="findingList" role="listbox" aria-label="Findings"></div>
+              <div class="finding-list" id="findingList" role="listbox" aria-label="Issues"></div>
             </div>
 
             <aside class="card detail-card" id="detail" aria-live="polite">
               <div class="detail-empty" id="detailEmpty">
                 <svg><use href="#i-search"/></svg>
-                <p>Select a finding to see its code, the AI's verdict and a suggested fix.</p>
+                <p>Select an issue to see the code, the AI's explanation and its suggested fix.</p>
               </div>
               <div id="detailBody" hidden></div>
             </aside>
           </section>
 
-          <details class="card scan-log">
-            <summary>Scan log <span class="muted small" id="scanLogSummary"></span></summary>
-            <div class="log-table" id="scanLog"></div>
+          <details class="card scan-log" id="filesCard">
+            <summary>Files <span class="muted small" id="filesSummary"></span></summary>
+            <div class="log-table" id="filesTable"></div>
           </details>
         </div>
       </section>
@@ -222,27 +198,21 @@
         <button type="button" class="icon-btn" data-close aria-label="Close"><svg><use href="#i-x"/></svg></button>
       </header>
       <div class="modal-body">
-        <label class="field"><span>Project name</span><input name="name" required maxlength="100" placeholder="e.g. Payments API"></label>
+        <label class="field"><span>Project name</span><input name="name" required maxlength="100" placeholder="e.g. One App Auth Service"></label>
         <div class="field" id="sourceField">
           <span>Source</span>
           <div class="segmented" role="radiogroup">
-            <label><input type="radio" name="source_type" value="local" checked><span><svg><use href="#i-folder"/></svg>Local folder</span></label>
+            <label><input type="radio" name="source_type" value="local" checked><span><svg><use href="#i-folder"/></svg>Local git repo</span></label>
             <label><input type="radio" name="source_type" value="github"><span><svg><use href="#i-github"/></svg>GitHub URL</span></label>
           </div>
         </div>
         <label class="field" id="pathField"><span id="pathLabel">Folder path</span>
           <input name="path_or_url" required placeholder="C:\Projects\my-app" autocomplete="off">
-          <small class="hint" id="pathHint">Must be inside an allowed folder (your home folder by default).</small>
+          <small class="hint" id="pathHint">A folder inside an allowed location (your home folder by default).</small>
         </label>
-        <label class="field"><span><svg class="inline"><use href="#i-branch"/></svg>Default branch to compare with <em>(optional)</em></span>
-          <input name="base_ref" placeholder="e.g. main — only changed code is reviewed" autocomplete="off"></label>
-        <details class="sub-section">
-          <summary>SonarQube (optional)</summary>
-          <label class="field"><span>Server URL</span><input name="sonar_host" placeholder="http://localhost:9000" autocomplete="off"></label>
-          <label class="field"><span>Token</span><input name="sonar_token" type="password" autocomplete="new-password" placeholder="Leave empty to keep the saved token"></label>
-          <label class="field"><span>Project key</span><input name="sonar_project_key" autocomplete="off"></label>
-          <div class="row"><button type="button" class="btn btn-ghost" id="sonarTestBtn">Test connection</button><span class="small" id="sonarTestResult"></span></div>
-        </details>
+        <label class="field"><span><svg class="inline"><use href="#i-branch"/></svg>Branch to compare with <em>(optional)</em></span>
+          <input name="base_ref" placeholder="e.g. main or pm-dev" autocomplete="off">
+          <small class="hint">With a branch, the AI reviews only what changed since it (including uncommitted work). Leave empty to review the whole project.</small></label>
         <div class="form-error" id="projectError" role="alert" hidden></div>
       </div>
       <footer class="modal-foot">
@@ -254,24 +224,14 @@
     </form>
   </dialog>
 
-  <!-- Tools -->
-  <dialog class="modal" id="toolsModal">
-    <form method="dialog">
-      <header class="modal-head"><h2>Installed tools</h2>
-        <button type="button" class="icon-btn" data-close aria-label="Close"><svg><use href="#i-x"/></svg></button></header>
-      <div class="modal-body"><p class="muted small">Gates whose tools are missing show as skipped and keep the verdict at WARN or below.</p>
-        <div id="toolsList" class="tools-list"></div></div>
-    </form>
-  </dialog>
-
-  <!-- Suppress -->
+  <!-- Ignore -->
   <dialog class="modal modal-sm" id="suppressModal">
     <form method="dialog" id="suppressForm">
       <header class="modal-head"><h2 id="suppressTitle">Mark as false positive</h2>
         <button type="button" class="icon-btn" data-close aria-label="Close"><svg><use href="#i-x"/></svg></button></header>
       <div class="modal-body">
-        <label class="field"><span>Reason <em>(optional, shown to your team)</em></span>
-          <input name="reason" maxlength="300" placeholder="e.g. input is a constant"></label>
+        <label class="field"><span>Reason <em>(optional)</em></span>
+          <input name="reason" maxlength="300" placeholder="e.g. input is validated by the controller" autofocus></label>
       </div>
       <footer class="modal-foot"><span class="spacer"></span>
         <button type="button" class="btn btn-ghost" data-close>Cancel</button>

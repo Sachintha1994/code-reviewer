@@ -1,7 +1,7 @@
 """Configuration loading.
 
-Defaults live in quality-gates.yml next to the app. A scanned project may put
-its own quality-gates.yml in its root to override individual keys.
+Defaults live in reviewer.yml next to the app. A reviewed project may put its
+own reviewer.yml in its root to override individual keys.
 """
 from __future__ import annotations
 
@@ -13,10 +13,10 @@ from typing import Any, Dict, Optional
 import yaml
 
 APP_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_PATH = APP_ROOT / "quality-gates.yml"
+DEFAULT_CONFIG_PATH = APP_ROOT / "reviewer.yml"
 DATA_DIR = Path(os.getenv("REVIEWER_DATA_DIR", APP_ROOT / "data"))
 
-try:  # optional: load .env so API keys never have to live in code
+try:  # load .env so API keys never have to live in code
     from dotenv import load_dotenv
 
     load_dotenv(APP_ROOT / ".env")
@@ -45,19 +45,15 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
 
 
 def load_config(project_root: Optional[str | Path] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Return the effective config: app defaults < project file < explicit overrides."""
+    """Effective config: app defaults < the project's reviewer.yml < explicit overrides."""
     cfg = _read_yaml(DEFAULT_CONFIG_PATH)
     if project_root:
-        project_file = Path(project_root) / "quality-gates.yml"
+        project_file = Path(project_root) / "reviewer.yml"
         if project_file.resolve() != DEFAULT_CONFIG_PATH.resolve():
             cfg = _deep_merge(cfg, _read_yaml(project_file))
     if overrides:
         cfg = _deep_merge(cfg, overrides)
     return cfg
-
-
-def gate_cfg(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
-    return (cfg.get("gates") or {}).get(name) or {}
 
 
 def allowed_roots(cfg: Dict[str, Any]) -> list[Path]:

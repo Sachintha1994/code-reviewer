@@ -1,13 +1,14 @@
 .env
-data/
+/data/
 __pycache__/
 *.pyc
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-cloned_projects/
-reports/
+/cloned_projects/
+/reports/
 _backup*/
 trivy-*/
 trivy*.zip
 trivy.exe
+.venv/
