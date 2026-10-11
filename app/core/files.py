@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import math
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -71,14 +72,25 @@ def is_excluded(rel_path: str, patterns: Sequence[str]) -> bool:
 _LINE_CACHE: Dict[str, List[str]] = {}
 
 
+def long_path(path: Path) -> str:
+    """On Windows, the long-path prefix lets file APIs go past the 260-character
+    path limit (deep Java packages often do). Elsewhere the path is returned as is."""
+    text = str(Path(path).absolute())
+    if os.name == "nt" and not text.startswith("\\\\?\\"):
+        return "\\\\?\\UNC\\" + text[2:] if text.startswith("\\\\") else "\\\\?\\" + text
+    return text
+
+
 def read_lines(path: Path) -> List[str]:
     key = str(path)
     if key not in _LINE_CACHE:
         try:
-            if path.stat().st_size > MAX_TEXT_FILE_BYTES:
+            target = long_path(path)
+            if os.path.getsize(target) > MAX_TEXT_FILE_BYTES:
                 _LINE_CACHE[key] = []
             else:
-                _LINE_CACHE[key] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                with open(target, encoding="utf-8", errors="replace") as fh:
+                    _LINE_CACHE[key] = fh.read().splitlines()
         except OSError:
             _LINE_CACHE[key] = []
     return _LINE_CACHE[key]

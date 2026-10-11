@@ -26,6 +26,7 @@ from app.core.diff import SAFE_REF
 from app.core.orchestrator import CodeReviewOrchestrator, clone_github_repo, validate_github_url
 from app.core.rescore import rescore
 from app.core.storage import Storage
+from app.core.files import exclude_patterns, is_excluded, language_of, long_path
 from app.core.uploads import UploadError, extract_zip, limits
 from app.reports.pdf_report import generate_pdf_report
 
@@ -36,6 +37,11 @@ templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 storage = Storage()
 
 UPLOAD_DIR = DATA_DIR / "uploads"                 # unpacked ZIP uploads, one folder per project
+KEEP_ALWAYS = {"reviewer.yml", ".reviewerignore"}
+
+
+def upload_dir(pid: str) -> Path:
+    return UPLOAD_DIR / pid[:8]   # short, so deep source paths stay under Windows' path limit
 PROGRESS: Dict[str, List[Dict[str, Any]]] = {}   # scan id -> progress events
 PROGRESS_LOCK = threading.Lock()
 RUNNING: Dict[str, str] = {}                      # project id -> scan id
@@ -221,10 +227,20 @@ async def _receive_zip(upload: UploadFile) -> Path:
 
 
 async def _unpack(pid: str, tmp: Path) -> str:
+    cfg = load_config()
+    excludes = exclude_patterns(Path("."), {"exclude": cfg.get("exclude")})
+
+    def keep(rel: str) -> bool:
+        # only what the reviewer reads: source and config files outside build/dependency folders
+        name = rel.rsplit("/", 1)[-1]
+        return name in KEEP_ALWAYS or (bool(language_of(rel)) and not is_excluded(rel, excludes))
+
     try:
-        root = await asyncio.to_thread(extract_zip, tmp, UPLOAD_DIR / pid, load_config())
+        root = await asyncio.to_thread(extract_zip, tmp, upload_dir(pid), cfg, keep)
     except UploadError as exc:
         raise HTTPException(400, str(exc)) from None
+    except OSError as exc:
+        raise HTTPException(400, f"couldn't unpack the ZIP: {exc}") from None
     finally:
         tmp.unlink(missing_ok=True)
     return str(root)
@@ -237,9 +253,9 @@ async def add_zip_project(name: str = Form(..., min_length=1, max_length=100),  
     project = storage.add_project({"name": name.strip(), "source_type": "zip", "path_or_url": "", "base_ref": ""})
     try:
         root = await _unpack(project["id"], tmp)
-    except HTTPException:
+    except Exception:  # never leave a half-created project behind
         storage.delete_project(project["id"])
-        shutil.rmtree(UPLOAD_DIR / project["id"], ignore_errors=True)
+        shutil.rmtree(long_path(upload_dir(project["id"])), ignore_errors=True)
         raise
     return public_project(storage.update_project(project["id"], {"path_or_url": root}) or project)
 
@@ -269,9 +285,9 @@ async def update_project(pid: str, req: ProjectUpdate):
 async def delete_project(pid: str):
     get_project_or_404(pid)
     storage.delete_project(pid)
-    for folder in (DATA_DIR / "cloned_projects" / pid, UPLOAD_DIR / pid):
+    for folder in (DATA_DIR / "cloned_projects" / pid, upload_dir(pid)):
         if folder.is_dir():
-            shutil.rmtree(folder, ignore_errors=True)
+            shutil.rmtree(long_path(folder), ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #

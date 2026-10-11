@@ -87,3 +87,11 @@ def test_zip_project_upload_and_replace(client):
                        files={"file": ("e.zip", _zip({"../evil.py": "x"}), "application/zip")})
     assert slip.status_code == 400 and len(client.get("/api/projects").json()) == 1
     assert client.delete(f"/api/projects/{pid}").status_code == 204
+
+
+def test_failed_zip_upload_leaves_no_project(client):
+    pytest.importorskip("multipart")
+    only_binaries = {"file": ("b.zip", _zip({"svc/target/A.class": "bin"}), "application/zip")}
+    resp = client.post("/api/projects/zip", data={"name": "x"}, files=only_binaries)
+    assert resp.status_code == 400 and "no source files" in resp.json()["detail"]
+    assert client.get("/api/projects").json() == []

@@ -298,3 +298,16 @@ def test_review_of_an_unzipped_project(tmp_path, monkeypatch):
     result = CodeReviewOrchestrator(str(root), base_ref="").run_full_review()
     assert [f.path for f in result.files] == ["A.java"] and result.verdict == "FAIL"
 
+
+
+def test_zip_keeps_only_reviewable_files(tmp_path):
+    long_name = "target/classes/lk/" + "x" * 150 + "/Builder$Inner$Deep.class"
+    z = make_zip(tmp_path / "app.zip", {"svc/src/A.java": "class A {}\n", f"svc/{long_name}": "bin",
+                                        "svc/node_modules/x/i.js": "1", "svc/reviewer.yml": "ai: {}\n"})
+    from app.core.files import is_excluded, language_of
+    keep = lambda rel: rel.endswith("reviewer.yml") or (bool(language_of(rel)) and not is_excluded(rel, ["target", "node_modules"]))  # noqa: E731
+    root = extract_zip(z, tmp_path / "out", {}, keep)
+    files = sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+    assert files == ["reviewer.yml", "src/A.java"]
+    with pytest.raises(UploadError, match="no source files"):
+        extract_zip(make_zip(tmp_path / "bin.zip", {"a/b.class": "x"}), tmp_path / "out2", {}, keep)
