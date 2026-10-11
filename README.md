@@ -22,8 +22,15 @@ copy .env.example .env        # then add GEMINI_API_KEY (or GROQ_API_KEY / OPENA
 python -m uvicorn app.web_dashboard:app --reload
 ```
 
-Open http://127.0.0.1:8000, click **Add project**, choose a folder (and a branch to compare
-with, if you want to review only changes), then click **Run review**.
+Open http://127.0.0.1:8000, click **Add project** and pick a source:
+
+- **Local git repo:** a folder on your computer, plus a branch to compare with if you want to
+  review only the changes.
+- **GitHub URL:** the repository is cloned first.
+- **ZIP file:** upload a ZIP of the code; the whole project inside it is reviewed. Use
+  **Settings → Upload a new version** to review an updated ZIP later.
+
+Then click **Run review**.
 
 From the command line:
 
@@ -63,6 +70,9 @@ is sent to the AI. Results are cached, so re-reviewing an unchanged file costs n
 
 ## Settings
 
+ZIP uploads are checked before unpacking: paths that escape the folder, symlinks, more than
+50,000 files or more than 1 GB unpacked are refused (limits in `reviewer.yml` under `uploads`).
+
 `reviewer.yml` holds the AI provider and model (Gemini, Groq, OpenAI or a local Ollama model; set `ai.model` to switch models, e.g. a Gemini Pro model for deeper reviews), what the AI should look for (`ai.focus`, edit
 it to match your team's standards), size limits, excluded folders and the folders the dashboard
 may open. A project can override any value with its own `reviewer.yml` in its root, and
@@ -87,6 +97,7 @@ app/core/orchestrator.py   finds changes, runs the AI review, builds the result
 app/core/ai_review.py      prompts, chunking, provider setup
 app/core/findings.py       duplicates, ignores, fingerprints, verdict
 app/core/diff.py           git diff parsing
+app/core/uploads.py        safe ZIP extraction
 app/core/storage.py        SQLite: projects, review history, ignored issues, AI cache
 app/reports/pdf_report.py  PDF export
 tests/                     tests (the AI is replaced by a fake)

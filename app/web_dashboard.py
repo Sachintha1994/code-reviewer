@@ -10,10 +10,11 @@ import json
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -25,6 +26,7 @@ from app.core.diff import SAFE_REF
 from app.core.orchestrator import CodeReviewOrchestrator, clone_github_repo, validate_github_url
 from app.core.rescore import rescore
 from app.core.storage import Storage
+from app.core.uploads import UploadError, extract_zip, limits
 from app.reports.pdf_report import generate_pdf_report
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -33,6 +35,7 @@ app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="stati
 templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 storage = Storage()
 
+UPLOAD_DIR = DATA_DIR / "uploads"                 # unpacked ZIP uploads, one folder per project
 PROGRESS: Dict[str, List[Dict[str, Any]]] = {}   # scan id -> progress events
 PROGRESS_LOCK = threading.Lock()
 RUNNING: Dict[str, str] = {}                      # project id -> scan id
@@ -105,6 +108,9 @@ def validate_local_path(raw: str, needs_git: bool = True) -> str:
 def public_project(p: Dict[str, Any]) -> Dict[str, Any]:
     keep = ("id", "name", "source_type", "path_or_url", "base_ref", "created_at", "last_verdict", "last_scan")
     out = {k: p.get(k) for k in keep}
+    if p.get("source_type") == "zip":
+        out["path_or_url"] = f"Uploaded ZIP: {Path(p['path_or_url']).name}"
+        out["base_ref"] = ""
     out["running_scan"] = RUNNING.get(p["id"])
     return out
 
@@ -125,6 +131,8 @@ def run_scan(scan_id: str, project: Dict[str, Any], base_ref: str) -> None:
     pid = project["id"]
     try:
         target = project["path_or_url"]
+        if project["source_type"] == "zip":
+            base_ref = ""  # an uploaded ZIP has no history: always a whole-project review
         if project["source_type"] == "github":
             emit(scan_id, {"stage": "clone", "message": "Cloning repository"})
             target = clone_github_repo(target, pid)
@@ -187,6 +195,67 @@ async def add_project(req: ProjectIn):
     return public_project(storage.add_project(data))
 
 
+async def _receive_zip(upload: UploadFile) -> Path:
+    """Stream the upload to a temporary file, enforcing the size limit."""
+    if not (upload.filename or "").lower().endswith(".zip"):
+        raise HTTPException(400, "choose a .zip file")
+    max_bytes = limits(load_config())["max_zip_mb"] * 1024 * 1024
+    incoming = UPLOAD_DIR / "_incoming"
+    incoming.mkdir(parents=True, exist_ok=True)
+    tmp = incoming / f"{uuid.uuid4()}.zip"
+    size = 0
+    try:
+        with open(tmp, "wb") as out:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise HTTPException(413, f"the ZIP is larger than {max_bytes // (1024 * 1024)} MB")
+                out.write(chunk)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return tmp
+
+
+async def _unpack(pid: str, tmp: Path) -> str:
+    try:
+        root = await asyncio.to_thread(extract_zip, tmp, UPLOAD_DIR / pid, load_config())
+    except UploadError as exc:
+        raise HTTPException(400, str(exc)) from None
+    finally:
+        tmp.unlink(missing_ok=True)
+    return str(root)
+
+
+@app.post("/api/projects/zip", status_code=201)
+async def add_zip_project(name: str = Form(..., min_length=1, max_length=100),  # noqa: B008
+                          file: UploadFile = File(...)):  # noqa: B008
+    tmp = await _receive_zip(file)
+    project = storage.add_project({"name": name.strip(), "source_type": "zip", "path_or_url": "", "base_ref": ""})
+    try:
+        root = await _unpack(project["id"], tmp)
+    except HTTPException:
+        storage.delete_project(project["id"])
+        shutil.rmtree(UPLOAD_DIR / project["id"], ignore_errors=True)
+        raise
+    return public_project(storage.update_project(project["id"], {"path_or_url": root}) or project)
+
+
+@app.post("/api/projects/{pid}/zip")
+async def replace_zip(pid: str, file: UploadFile = File(...)):  # noqa: B008
+    project = get_project_or_404(pid)
+    if project["source_type"] != "zip":
+        raise HTTPException(400, "only projects created from a ZIP can take a new ZIP")
+    if pid in RUNNING:
+        raise HTTPException(409, "wait for the running review to finish")
+    tmp = await _receive_zip(file)
+    root = await _unpack(pid, tmp)
+    return public_project(storage.update_project(pid, {"path_or_url": root}) or project)
+
+
 @app.patch("/api/projects/{pid}")
 async def update_project(pid: str, req: ProjectUpdate):
     get_project_or_404(pid)
@@ -200,9 +269,9 @@ async def update_project(pid: str, req: ProjectUpdate):
 async def delete_project(pid: str):
     get_project_or_404(pid)
     storage.delete_project(pid)
-    clone = DATA_DIR / "cloned_projects" / pid
-    if clone.is_dir():
-        shutil.rmtree(clone, ignore_errors=True)
+    for folder in (DATA_DIR / "cloned_projects" / pid, UPLOAD_DIR / pid):
+        if folder.is_dir():
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -214,8 +283,9 @@ async def start_scan(pid: str, req: ScanIn, background: BackgroundTasks):
     project = get_project_or_404(pid)
     if pid in RUNNING:
         raise HTTPException(409, "a review is already running for this project")
-    # an empty branch means the whole project is reviewed
-    base_ref = "" if req.whole_project else (req.base_ref or project.get("base_ref") or "")
+    # an empty branch means the whole project is reviewed; uploaded ZIPs are always reviewed whole
+    whole = req.whole_project or project.get("source_type") == "zip"
+    base_ref = "" if whole else (req.base_ref or project.get("base_ref") or "")
     reviewer = AIReviewer(load_config())
     if not reviewer.available:
         raise HTTPException(400, reviewer.reason)

@@ -49,6 +49,11 @@ exclude:
   - "*.generated.*"
   - "*.pb.go"
 
+uploads:
+  max_zip_mb: 200           # largest ZIP the dashboard accepts
+  max_unzipped_mb: 1000     # refuse ZIPs that unpack to more than this
+  max_files: 50000
+
 server:
   # Local folders the dashboard may review. Empty = your home folder only.
   # Can also be set with REVIEWER_ALLOWED_ROOTS (separate folders with ; on Windows).

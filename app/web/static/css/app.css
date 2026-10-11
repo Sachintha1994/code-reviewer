@@ -498,3 +498,8 @@ input:focus, select:focus { outline: none; border-color: var(--accent); box-shad
 .explorer > *, .summary > *, .content > * { min-width: 0; }
 .detail-meta .mono, .detail-title { overflow-wrap: anywhere; min-width: 0; }
 .detail-tags { flex-wrap: wrap; }
+.segmented { grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 480px) { .segmented { grid-template-columns: 1fr; } }
+.file-input { height: auto; padding: 8px; background: var(--surface-2); cursor: pointer; }
+.file-input::file-selector-button { font: inherit; font-weight: 500; margin-right: 10px; padding: 6px 12px; border-radius: 6px;
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); cursor: pointer; }

@@ -58,3 +58,32 @@ def test_project_lifecycle(client, tmp_path):
 def test_ai_status(client, monkeypatch):
     body = client.get("/api/ai").json()
     assert set(body) >= {"available", "provider", "model", "reason"}
+
+
+def _zip(files):
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, text in files.items():
+            z.writestr(name, text)
+    return buf.getvalue()
+
+
+def test_zip_project_upload_and_replace(client):
+    pytest.importorskip("multipart")
+    files = {"file": ("auth-service.zip", _zip({"auth-service/src/A.java": "class A {}\n"}), "application/zip")}
+    created = client.post("/api/projects/zip", data={"name": "Auth"}, files=files)
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["source_type"] == "zip" and body["path_or_url"] == "Uploaded ZIP: auth-service" and body["base_ref"] == ""
+    pid = body["id"]
+    new = {"file": ("v2.zip", _zip({"v2/src/B.java": "class B {}\n"}), "application/zip")}
+    assert client.post(f"/api/projects/{pid}/zip", files=new).json()["path_or_url"] == "Uploaded ZIP: v2"
+    bad = client.post("/api/projects/zip", data={"name": "x"}, files={"file": ("a.txt", b"hi", "text/plain")})
+    assert bad.status_code == 400
+    slip = client.post("/api/projects/zip", data={"name": "x"},
+                       files={"file": ("e.zip", _zip({"../evil.py": "x"}), "application/zip")})
+    assert slip.status_code == 400 and len(client.get("/api/projects").json()) == 1
+    assert client.delete(f"/api/projects/{pid}").status_code == 204

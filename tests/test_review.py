@@ -244,3 +244,57 @@ def test_whole_project_review_without_base(tmp_path, monkeypatch):
     assert result.verdict == "WARN"
     assert "Whole-file review" in calls[0] and "+    1 | class A {" in calls[0]
     assert "whole project" in calls[-1]
+
+
+# ------------------------------------------------------------------ ZIP uploads
+import zipfile  # noqa: E402
+
+from app.core.uploads import UploadError, extract_zip  # noqa: E402
+
+
+def make_zip(path, files, symlink=None):
+    with zipfile.ZipFile(path, "w") as z:
+        for name, text in files.items():
+            z.writestr(name, text)
+        if symlink:
+            info = zipfile.ZipInfo(symlink)
+            info.external_attr = (0o120777 << 16)
+            z.writestr(info, "/etc/passwd")
+    return path
+
+
+def test_zip_with_single_top_folder_becomes_the_root(tmp_path):
+    z = make_zip(tmp_path / "a.zip", {"my-app/src/A.java": "class A {}\n", "my-app/pom.xml": "<project/>\n",
+                                      "__MACOSX/._A.java": "junk"}, symlink="my-app/link")
+    root = extract_zip(z, tmp_path / "out", {})
+    assert root.name == "my-app"
+    assert (root / "src" / "A.java").read_text() == "class A {}\n"
+    assert not (root / "link").exists() and not (tmp_path / "out" / "__MACOSX").exists()
+
+
+@pytest.mark.parametrize("name", ["../evil.py", "a/../../evil.py", "/etc/evil", "C:/evil.py"])
+def test_zip_slip_is_refused(tmp_path, name):
+    z = make_zip(tmp_path / "bad.zip", {"ok.py": "x = 1\n", name: "boom"})
+    with pytest.raises(UploadError):
+        extract_zip(z, tmp_path / "out", {})
+    assert not (tmp_path / "evil.py").exists()
+
+
+def test_zip_limits(tmp_path):
+    z = make_zip(tmp_path / "big.zip", {f"f{i}.py": "x" for i in range(5)})
+    with pytest.raises(UploadError, match="more than 3 files"):
+        extract_zip(z, tmp_path / "out", {"uploads": {"max_files": 3}})
+    bomb = make_zip(tmp_path / "bomb.zip", {"a.txt": "0" * (3 * 1024 * 1024)})
+    with pytest.raises(UploadError, match="MB"):
+        extract_zip(bomb, tmp_path / "out2", {"uploads": {"max_unzipped_mb": 1}})
+    (tmp_path / "not.zip").write_bytes(b"hello")
+    with pytest.raises(UploadError, match="valid ZIP"):
+        extract_zip(tmp_path / "not.zip", tmp_path / "out3", {})
+
+
+def test_review_of_an_unzipped_project(tmp_path, monkeypatch):
+    fake_ai(monkeypatch, [{"line": 1, "severity": "HIGH", "category": "bug", "title": "Empty class", "confidence": 0.9}])
+    root = extract_zip(make_zip(tmp_path / "a.zip", {"app/A.java": "class A {}\n"}), tmp_path / "out", {})
+    result = CodeReviewOrchestrator(str(root), base_ref="").run_full_review()
+    assert [f.path for f in result.files] == ["A.java"] and result.verdict == "FAIL"
+

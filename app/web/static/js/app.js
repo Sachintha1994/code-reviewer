@@ -162,7 +162,7 @@
       el('span', { class: p.running_scan ? 'dot dot-running' : (VERDICT_DOT[p.last_verdict] || 'dot dot-none') }),
       el('span', { style: { minWidth: 0 } },
         el('div', { class: 'project-name', text: p.name }),
-        el('div', { class: 'project-sub', text: `${p.base_ref ? `vs ${p.base_ref}` : 'whole project'}${p.last_scan ? ` · ${timeAgo(p.last_scan)}` : ''}` }))));
+        el('div', { class: 'project-sub', text: `${p.source_type === 'zip' ? 'ZIP upload' : p.base_ref ? `vs ${p.base_ref}` : 'whole project'}${p.last_scan ? ` · ${timeAgo(p.last_scan)}` : ''}` }))));
     }
   }
 
@@ -175,7 +175,9 @@
     show($('#settingsBtn'), Boolean(p));
     show($('#pdfBtn'), Boolean(p && state.result));
     if (!p) return;
-    meta.append(el('span', { title: p.path_or_url }, icon(p.source_type === 'github' ? 'github' : 'folder'),
+    const srcIcon = { github: 'github', zip: 'layers' }[p.source_type] || 'folder';
+    show($('#runOptionsBtn'), p.source_type !== 'zip');   // a ZIP is always reviewed whole
+    meta.append(el('span', { title: p.path_or_url }, icon(srcIcon),
       p.path_or_url.length > 60 ? `…${p.path_or_url.slice(-58)}` : p.path_or_url));
     const ref = state.result ? state.result.base_ref : p.base_ref;
     meta.append(el('span', null, icon('branch'), ref ? `changes since ${ref}` : 'whole project'));
@@ -724,7 +726,14 @@
   let editingId = null;
 
   function updateSourceHints() {
-    const github = projectForm.elements.source_type.value === 'github';
+    const type = projectForm.elements.source_type.value;
+    const zip = type === 'zip';
+    const editingZip = Boolean(editingId) && state.project && state.project.source_type === 'zip';
+    show($('#pathField'), !zip && !editingZip);
+    show($('#branchField'), !zip && !editingZip);
+    show($('#zipField'), zip || editingZip);
+    $('#zipLabel').textContent = editingZip ? 'Upload a new version (optional)' : 'ZIP of the code';
+    const github = type === 'github';
     $('#pathLabel').textContent = github ? 'Repository URL' : 'Folder path';
     projectForm.elements.path_or_url.placeholder = github ? 'https://github.com/owner/repo' : 'C:\\Projects\\my-app';
     $('#pathHint').textContent = github
@@ -746,6 +755,7 @@
       for (const key of ['name', 'path_or_url', 'base_ref']) projectForm.elements[key].value = project[key] || '';
       projectForm.elements.source_type.value = project.source_type;
     }
+    $('#saveProjectBtn').textContent = 'Save project';
     updateSourceHints();
     $('#projectModal').showModal();
     projectForm.elements.name.focus();
@@ -755,29 +765,75 @@
   $('#welcomeAdd').addEventListener('click', () => openProjectModal(null));
   $('#settingsBtn').addEventListener('click', () => openProjectModal(state.project));
 
+  // Upload with progress (fetch can't report upload progress).
+  function uploadForm(url, formData, onProgress) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url);
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(Math.round((100 * e.loaded) / e.total)); };
+      xhr.upload.onload = () => onProgress(100);
+      xhr.onload = () => {
+        let data = null;
+        try { data = JSON.parse(xhr.responseText); } catch (err) { /* not JSON */ }
+        if (xhr.status >= 200 && xhr.status < 300) resolve(data);
+        else {
+          const detail = data && data.detail;
+          reject(new Error(Array.isArray(detail) ? detail.map((d) => d.msg).join('; ') : detail || `Upload failed (${xhr.status})`));
+        }
+      };
+      xhr.onerror = () => reject(new Error('Upload failed: the server could not be reached'));
+      xhr.send(formData);
+    });
+  }
+
   projectForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     const data = Object.fromEntries(new FormData(projectForm).entries());
+    const zipFile = projectForm.elements.zip_file.files[0] || null;
+    const isZip = data.source_type === 'zip' || (editingId && state.project && state.project.source_type === 'zip');
     const errorBox = $('#projectError');
-    if (!data.name || (!editingId && !data.path_or_url)) {
-      errorBox.textContent = 'Name and path are required.';
+    const saveBtn = $('#saveProjectBtn');
+    show(errorBox, false);
+    if (!data.name || (!editingId && !isZip && !data.path_or_url) || (!editingId && isZip && !zipFile)) {
+      errorBox.textContent = isZip ? 'Give the project a name and choose a ZIP file.' : 'Name and path are required.';
       show(errorBox, true);
       return;
     }
-    $('#saveProjectBtn').disabled = true;
+    if (zipFile && !/\.zip$/i.test(zipFile.name)) {
+      errorBox.textContent = 'Choose a .zip file.';
+      show(errorBox, true);
+      return;
+    }
+    saveBtn.disabled = true;
+    const progressText = (pct) => { saveBtn.textContent = pct < 100 ? `Uploading ${pct}%` : 'Unpacking…'; };
     try {
-      const project = editingId
-        ? await api('PATCH', `/api/projects/${editingId}`, { name: data.name, base_ref: data.base_ref })
-        : await api('POST', '/api/projects', data);
+      let project;
+      if (!editingId && isZip) {
+        const form = new FormData();
+        form.append('name', data.name);
+        form.append('file', zipFile);
+        project = await uploadForm('/api/projects/zip', form, progressText);
+      } else if (editingId) {
+        if (isZip && zipFile) {
+          const form = new FormData();
+          form.append('file', zipFile);
+          await uploadForm(`/api/projects/${editingId}/zip`, form, progressText);
+        }
+        const patch = isZip ? { name: data.name } : { name: data.name, base_ref: data.base_ref };
+        project = await api('PATCH', `/api/projects/${editingId}`, patch);
+      } else {
+        project = await api('POST', '/api/projects', data);
+      }
       $('#projectModal').close();
       await loadProjects();
-      toast(editingId ? 'Project saved' : 'Project added');
+      toast(editingId ? (zipFile ? 'New version uploaded' : 'Project saved') : 'Project added');
       if (editingId) { state.project = state.projects.find((p) => p.id === project.id); renderTopbar(); } else selectProject(project.id);
     } catch (err) {
       errorBox.textContent = err.message;
       show(errorBox, true);
     } finally {
-      $('#saveProjectBtn').disabled = false;
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save project';
     }
   });
 

@@ -204,13 +204,18 @@
           <div class="segmented" role="radiogroup">
             <label><input type="radio" name="source_type" value="local" checked><span><svg><use href="#i-folder"/></svg>Local git repo</span></label>
             <label><input type="radio" name="source_type" value="github"><span><svg><use href="#i-github"/></svg>GitHub URL</span></label>
+            <label><input type="radio" name="source_type" value="zip"><span><svg><use href="#i-layers"/></svg>ZIP file</span></label>
           </div>
         </div>
         <label class="field" id="pathField"><span id="pathLabel">Folder path</span>
           <input name="path_or_url" required placeholder="C:\Projects\my-app" autocomplete="off">
           <small class="hint" id="pathHint">A folder inside an allowed location (your home folder by default).</small>
         </label>
-        <label class="field"><span><svg class="inline"><use href="#i-branch"/></svg>Branch to compare with <em>(optional)</em></span>
+        <label class="field" id="zipField" hidden><span id="zipLabel">ZIP of the code</span>
+          <input type="file" name="zip_file" accept=".zip,application/zip,application/x-zip-compressed" class="file-input">
+          <small class="hint" id="zipHint">The whole project inside the ZIP is reviewed. Folders like node_modules and target are skipped.</small>
+        </label>
+        <label class="field" id="branchField"><span><svg class="inline"><use href="#i-branch"/></svg>Branch to compare with <em>(optional)</em></span>
           <input name="base_ref" placeholder="e.g. main or pm-dev" autocomplete="off">
           <small class="hint">With a branch, the AI reviews only what changed since it (including uncommitted work). Leave empty to review the whole project.</small></label>
         <div class="form-error" id="projectError" role="alert" hidden></div>
