@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.config import DATA_DIR, load_config
 from app.core import findings as fx
-from app.core.ai_review import AIReviewer
+from app.core.ai_review import AIReviewer, QuotaExhausted, Unit
 from app.core.diff import DiffError, collect_diff
 from app.core.files import clear_line_cache, exclude_patterns, is_excluded, language_of, read_lines
 from app.core.models import FileReview, Finding, ReviewResult
@@ -70,29 +71,67 @@ class CodeReviewOrchestrator:
 
         findings: List[Finding] = []
         by_path = {f.path: f for f in files}
+        batches = reviewer.plan_requests(self.root, [(p, set(added[p])) for p in to_review])
+        if len(batches) > 1:
+            self._emit("review", f"{len(to_review)} files packed into {len(batches)} AI requests", total=len(to_review))
+        parts_left = {p: 0 for p in to_review}
+        for batch in batches:
+            for rel in {u.rel for u in batch}:
+                parts_left[rel] += 1
+        stop = threading.Event()
+        quota_message = ""
+        lock = threading.Lock()
 
-        def work(path: str) -> Tuple[str, List[Finding], int, bool, Optional[str]]:
-            self.progress({"stage": "review", "tool": path, "status": "running"})
+        def work(batch: List[Unit]) -> Tuple[List[Unit], Dict[str, List[Finding]], bool, Optional[str]]:
+            if stop.is_set():
+                return batch, {}, False, "quota"
+            for rel in {u.rel for u in batch}:
+                self.progress({"stage": "review", "tool": rel, "status": "running"})
             try:
-                issues, chunks, cached = reviewer.review_file(self.root, path, set(added[path]), base_ref)
-                return path, issues, chunks, cached, None
+                result, cached = reviewer.review_batch(batch, base_ref)
+                return batch, result, cached, None
+            except QuotaExhausted as exc:
+                nonlocal quota_message
+                with lock:
+                    quota_message = quota_message or str(exc)
+                stop.set()
+                return batch, {}, False, "quota"
             except Exception as exc:
-                return path, [], 0, False, f"{type(exc).__name__}: {exc}"
+                return batch, {}, False, f"{type(exc).__name__}: {exc}"
 
         with ThreadPoolExecutor(max_workers=max(1, int(ai_cfg.get("max_workers", 4)))) as pool:
-            for path, issues, chunks, cached, error in pool.map(work, to_review):
-                review = by_path[path]
-                if error:
-                    review.status, review.message = "error", error[:500]
-                else:
-                    review.status, review.issues, review.chunks, review.cached = "reviewed", len(issues), chunks, cached
-                    findings.extend(issues)
-                self.progress({"stage": "review", "tool": path, "status": review.status,
-                               "message": review.message, "findings": review.issues})
+            for batch, result, cached, error in pool.map(work, batches):
+                for rel in dict.fromkeys(u.rel for u in batch):
+                    review = by_path[rel]
+                    parts_left[rel] -= 1
+                    if error == "quota":
+                        if review.status != "error":
+                            review.status = "skipped"
+                            review.message = ("AI quota reached; run the review again later to continue "
+                                              "(finished files are cached)")
+                    elif error:
+                        review.status, review.message = "error", error[:500]
+                    elif review.status == "pending":
+                        review.status = "reviewed"
+                        review.cached = cached
+                    elif review.status == "reviewed":
+                        review.cached = review.cached and cached
+                    if not error:
+                        issues = result.get(rel, [])
+                        review.issues += len(issues)
+                        review.chunks += sum(1 for u in batch if u.rel == rel)
+                        findings.extend(issues)
+                    if parts_left[rel] == 0:
+                        self.progress({"stage": "review", "tool": rel, "status": review.status,
+                                       "message": review.message, "findings": review.issues})
 
+        # a file with some parts reviewed and some cut off by the quota is partial: keep its issues, flag it
         reviewed = [f for f in files if f.status == "reviewed"]
         errors = [f for f in files if f.status == "error"]
+        quota_skipped = [f for f in files if f.status == "skipped" and f.message.startswith("AI quota")]
         if to_review and not reviewed:
+            if quota_message:
+                raise RuntimeError(quota_message)
             raise RuntimeError(f"the AI review failed for every file. First error: {errors[0].message}")
 
         self._emit("process", "Merging results")
@@ -104,7 +143,7 @@ class CodeReviewOrchestrator:
         findings = fx.sort_findings(findings)
 
         summary = ""
-        if ai_cfg.get("summary", True) and to_review:
+        if ai_cfg.get("summary", True) and to_review and not quota_message:
             self._emit("summary", "Writing the summary")
             try:
                 summary = reviewer.summarize(base_ref, {p: added[p] for p in to_review},
@@ -115,6 +154,9 @@ class CodeReviewOrchestrator:
         verdict, label, reason = fx.decide_verdict(findings)
         if errors:
             reason += f"; {len(errors)} file{'s' if len(errors) != 1 else ''} couldn't be reviewed"
+        if quota_skipped:
+            reason += (f"; partial review: the AI quota ran out with {len(quota_skipped)} "
+                       f"file{'s' if len(quota_skipped) != 1 else ''} left. Run it again later to continue")
         stats = {
             "scope": "changes" if base_ref else "project",
             "files_changed": len(changed_files), "files_reviewed": len(reviewed),
@@ -123,7 +165,8 @@ class CodeReviewOrchestrator:
             "lines_removed": removed,
             "issues": sum(1 for f in findings if f.counts), "ignored": sum(1 for f in findings if f.suppressed),
             "by_severity": fx.counts_by_severity(findings),
-            "requests": sum(f.chunks for f in reviewed), "cached_files": sum(1 for f in reviewed if f.cached),
+            "requests": len(batches), "files_quota_skipped": len(quota_skipped),
+            "cached_files": sum(1 for f in reviewed if f.cached),
         }
         self._emit("done", f"{label}: {reason}", verdict=verdict)
         return ReviewResult(
@@ -162,7 +205,7 @@ class CodeReviewOrchestrator:
 
     def _plan(self, added: Dict[str, Dict[int, str]], excludes: List[str], ai_cfg: Dict[str, Any],
               whole: bool = False) -> Tuple[List[FileReview], List[str]]:
-        max_files = int(ai_cfg.get("max_files", 80))
+        max_files = int(ai_cfg.get("max_files", 1000))
         too_big = int(ai_cfg.get("skip_files_with_more_changed_lines_than", 3000))
         files: List[FileReview] = []
         to_review: List[str] = []

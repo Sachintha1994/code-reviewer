@@ -10,13 +10,17 @@ base_ref: ""
 ai:
   provider: ""              # gemini | groq | openai | ollama ; empty = pick from the API key in .env
   model: ""                 # empty = the provider's default
-  max_files: 80             # changed files reviewed per scan; the rest are listed as skipped
-  max_lines_per_request: 600
+  max_files: 1000           # files reviewed per scan; the rest are listed as skipped
+  # Lines of code sent in one AI request. Small files are packed together and big ones are
+  # split, so a 500-file project needs tens of requests instead of hundreds.
+  # 0 = the provider's default (gemini 2500, openai 1500, groq 500, ollama 300).
+  # Lower it if the AI misses issues in big batches; raise it to use fewer requests.
+  max_lines_per_request: 0
   whole_file_up_to: 400     # files up to this many lines are sent whole, larger ones as changed sections
   context_lines: 25         # unchanged lines shown around each changed section
   skip_files_with_more_changed_lines_than: 3000
   min_confidence: 0.5       # issues the AI is less sure about are dropped
-  max_workers: 4            # AI requests sent in parallel
+  max_workers: 2            # AI requests sent in parallel (keep low on free API tiers)
   summary: true             # write a short summary of the whole change
   # What to look for. Edit to match your team's standards.
   focus:

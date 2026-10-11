@@ -48,15 +48,27 @@ so it can run in CI or a pre-commit hook.
 1. Finds the code to review: everything changed since the base branch (`git diff`, including
    uncommitted and new files), or every source and config file when no branch is set.
    Whole-project reviews are capped at `ai.max_files` files per run (80 by default).
-2. Sends each changed source or config file to the AI. Files up to 400 lines go whole; larger
+2. Sends the changed source and config files to the AI. Files up to 400 lines go whole; larger
    files go as the changed sections with 25 lines around them. Changed lines are marked so the
-   AI reviews only those and uses the rest as context.
+   AI reviews only those and uses the rest as context. Small files are packed together into one
+   request (up to `ai.max_lines_per_request` lines; by default 2500 for Gemini), so even a large
+   project needs only a few dozen requests.
 3. Keeps issues that point at a changed line and that the AI is reasonably sure of
    (`min_confidence`), and removes duplicates.
 4. Writes a short summary of the whole change, and a verdict:
    - **Changes requested:** at least one critical or high-severity issue.
    - **Approve with comments:** medium issues only.
    - **Looks good:** nothing, or only minor suggestions.
+
+### Rate limits and quotas (429 errors)
+
+Free API tiers allow few requests (Gemini's free tier allows about 20 requests a day per model).
+When the provider asks the reviewer to wait a few seconds, it waits and carries on. When the
+quota is used up, the review stops, keeps everything reviewed so far, and lists the rest as
+skipped with "AI quota reached". Run the review again after the quota resets: files already
+reviewed come from the cache, so it continues where it stopped. To review big projects in one
+go, enable billing for your key in Google AI Studio, or raise `ai.max_lines_per_request` so each
+request carries more code.
 
 Secrets that look real (API keys, tokens, random-looking passwords) are masked before any code
 is sent to the AI. Results are cached, so re-reviewing an unchanged file costs nothing.

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
@@ -32,17 +33,16 @@ REVIEW_SYSTEM = (
 )
 
 REVIEW_TEMPLATE = """{intro}
-{part}Lines starting with + are the ones to review; other lines are context. "..." separates sections that are not next to each other.
+Lines starting with + are the ones to review; other lines are context. "..." separates sections that are not next to each other.
 
-```
-{code}
-```
+{files}
 
 Look for:
 {focus}
 
 Return JSON:
 {{"issues": [{{
+  "file": "<the file path exactly as written after ### File:>",
   "line": <first line number of the problem>,
   "end_line": <last line number of the problem>,
   "severity": "CRITICAL" | "HIGH" | "MEDIUM" | "LOW",
@@ -53,6 +53,38 @@ Return JSON:
   "fix": "the corrected code for lines line..end_line exactly as they should read, same indentation, no line numbers or + signs; empty string if the fix isn't a local code change"
 }}]}}
 Severity guide: CRITICAL = security hole or data loss; HIGH = bug that will hit users; MEDIUM = likely problem or risky code; LOW = minor improvement."""
+
+FILE_BLOCK = """### File: {path} ({language}){part}
+```
+{code}
+```"""
+
+# Lines of code per request when reviewer.yml doesn't set max_lines_per_request.
+# Packing many files into one request keeps reviews inside free-tier request quotas.
+PROVIDER_BATCH_LINES = {"gemini": 2500, "openai": 1500, "groq": 500, "ollama": 300}
+MAX_FILES_PER_REQUEST = 40
+
+
+class QuotaExhausted(RuntimeError):
+    """The provider's request quota is used up (e.g. Gemini's free-tier daily limit)."""
+
+
+def parse_retry_seconds(text: str) -> Optional[float]:
+    """Wait time from a rate-limit message: "retry in 22h3m18.4s", "retry in 25.3s", "retryDelay": "20s"."""
+    m = re.search(r"retry in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:([\d.]+)s)?", text, re.IGNORECASE)
+    if m and any(m.groups()):
+        hours, minutes, seconds = (float(g) if g else 0.0 for g in m.groups())
+        return hours * 3600 + minutes * 60 + seconds
+    m = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?([\d.]+)s", text)
+    return float(m.group(1)) if m else None
+
+
+class Unit:
+    """One file, or one part of a large file, to put in a request."""
+
+    def __init__(self, rel: str, lines: List[str], numbers: List[int], changed: Set[int], part: str):
+        self.rel, self.lines, self.numbers, self.changed, self.part = rel, lines, numbers, changed, part
+
 
 SUMMARY_SYSTEM = "You summarise code changes for a reviewer. Plain, specific, no marketing language. Reply with one JSON object only."
 SUMMARY_TEMPLATE = """{heading}:
@@ -203,8 +235,47 @@ class AIReviewer:
         if self._client is None:
             from openai import OpenAI
 
-            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=180, max_retries=3)
+            # retries are handled in _create so quota errors stop the review instead of looping
+            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url, timeout=300, max_retries=0)
         return self._client
+
+    @property
+    def batch_lines(self) -> int:
+        configured = int(self.cfg.get("max_lines_per_request") or 0)
+        return configured or PROVIDER_BATCH_LINES.get(self.provider or "", 1000)
+
+    def _create(self, messages: List[Dict[str, str]]):
+        """One chat completion, waiting out short rate limits and stopping on an exhausted quota."""
+        client = self._get_client()
+        for attempt in range(5):
+            try:
+                if self._json_mode:
+                    try:
+                        return client.chat.completions.create(model=self.model, messages=messages, temperature=0.1,
+                                                              response_format={"type": "json_object"})
+                    except Exception as exc:
+                        # Some providers reject JSON mode with a 400; the prompt already asks for JSON only.
+                        text = str(exc).lower()
+                        if getattr(exc, "status_code", None) in (400, 422) and ("response_format" in text or "json" in text
+                                                                                or getattr(exc, "status_code", None) == 400):
+                            self._json_mode = False
+                        else:
+                            raise
+                return client.chat.completions.create(model=self.model, messages=messages, temperature=0.1)
+            except Exception as exc:
+                text = str(exc)
+                limited = getattr(exc, "status_code", None) == 429 or "rate limit" in text.lower() or "quota" in text.lower()
+                if not limited:
+                    raise
+                wait = parse_retry_seconds(text)
+                if wait is not None and wait > 90:
+                    hours = wait / 3600
+                    when = f"in about {hours:.0f} hours" if hours >= 1.5 else f"in about {wait / 60:.0f} minutes"
+                    raise QuotaExhausted(f"{self.provider} quota used up; it resets {when}. {text[:300]}") from None
+                if attempt == 4:
+                    raise QuotaExhausted(f"{self.provider} kept rate-limiting the review. {text[:300]}") from None
+                time.sleep(min(wait if wait is not None else 5 * 2 ** attempt, 90))
+        raise QuotaExhausted("rate limited")  # pragma: no cover
 
     def complete_json(self, system: str, user: str) -> Tuple[Dict[str, Any], bool]:
         """Returns (parsed JSON, came_from_cache)."""
@@ -213,46 +284,92 @@ class AIReviewer:
         if cached:
             return json.loads(cached), True
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        client = self._get_client()
-        resp = None
-        if self._json_mode:
-            try:
-                resp = client.chat.completions.create(model=self.model, messages=messages, temperature=0.1,
-                                                      response_format={"type": "json_object"})
-            except Exception as exc:
-                # Some providers reject JSON mode with a 400; the prompt already asks for JSON only.
-                text = str(exc).lower()
-                if getattr(exc, "status_code", None) not in (400, 422) and "response_format" not in text and "json" not in text:
-                    raise
-                self._json_mode = False
-        if resp is None:
-            resp = client.chat.completions.create(model=self.model, messages=messages, temperature=0.1)
-        data = parse_json_object(resp.choices[0].message.content or "")
+        content = self._create(messages).choices[0].message.content or ""
+        try:
+            data = parse_json_object(content)
+        except (json.JSONDecodeError, ValueError):
+            # one more try: models occasionally break their own JSON
+            messages += [{"role": "assistant", "content": content[:4000]},
+                         {"role": "user", "content": "That reply was not valid JSON. Send the same answer again as one valid JSON object, nothing else."}]
+            data = parse_json_object(self._create(messages).choices[0].message.content or "")
         self.cache_set(key, json.dumps(data))
         return data, False
 
-    # -- one file ------------------------------------------------------------- #
-    def review_file(self, root: Path, rel: str, changed: Set[int], base_ref: str) -> Tuple[List[Finding], int, bool]:
-        """Review one changed file. Returns (issues, number of requests, all from cache)."""
-        lines = read_lines(root / rel)
-        chunks = build_chunks(len(lines), {n for n in changed if 1 <= n <= len(lines)},
-                              int(self.cfg.get("whole_file_up_to", 400)), int(self.cfg.get("context_lines", 25)),
-                              int(self.cfg.get("max_lines_per_request", 600)))
-        language = language_of(rel) or "text"
+    # -- planning requests ------------------------------------------------------ #
+    def plan_requests(self, root: Path, items: List[Tuple[str, Set[int]]]) -> List[List[Unit]]:
+        """Split large files into parts and pack small ones together, so each request
+        carries up to `batch_lines` lines. Deterministic, so a re-run hits the cache."""
+        limit = self.batch_lines
+        units: List[Unit] = []
+        for rel, changed in items:
+            lines = read_lines(root / rel)
+            changed = {n for n in changed if 1 <= n <= len(lines)}
+            chunks = build_chunks(len(lines), changed, int(self.cfg.get("whole_file_up_to", 400)),
+                                  int(self.cfg.get("context_lines", 25)), limit)
+            for i, numbers in enumerate(chunks):
+                part = f" - part {i + 1} of {len(chunks)}" if len(chunks) > 1 else ""
+                units.append(Unit(rel, lines, numbers, changed, part))
+        batches: List[List[Unit]] = []
+        current: List[Unit] = []
+        size = 0
+        for unit in units:
+            if current and (size + len(unit.numbers) > limit or len(current) >= MAX_FILES_PER_REQUEST):
+                batches.append(current)
+                current, size = [], 0
+            current.append(unit)
+            size += len(unit.numbers)
+        if current:
+            batches.append(current)
+        return batches
+
+    def review_batch(self, batch: List[Unit], base_ref: str) -> Tuple[Dict[str, List[Finding]], bool]:
+        """Review a request's worth of files. Returns ({file: issues}, came_from_cache)."""
         focus = "\n".join(f"- {item}" for item in (self.cfg.get("focus") or ["bugs", "security problems"]))
+        intro = (f"Code changes compared with {base_ref}." if base_ref else
+                 "Whole-file review of existing code: every line is in scope.")
+        files = "\n\n".join(FILE_BLOCK.format(path=u.rel, language=language_of(u.rel) or "text", part=u.part,
+                                                code=render_chunk(u.lines, u.numbers, u.changed)) for u in batch)
+        prompt = REVIEW_TEMPLATE.format(intro=intro, files=files, focus=focus,
+                                        categories=" | ".join(f'"{c}"' for c in CATEGORIES))
+        data, cached = self.complete_json(REVIEW_SYSTEM, prompt)
+        by_file: Dict[str, Dict[str, Any]] = {}
+        for u in batch:
+            entry = by_file.setdefault(u.rel, {"lines": u.lines, "shown": set(), "changed": u.changed})
+            entry["shown"].update(u.numbers)
+        issues_by_file: Dict[str, List[Dict[str, Any]]] = {rel: [] for rel in by_file}
+        only = next(iter(by_file)) if len(by_file) == 1 else None
+        for issue in data.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            target = self._match_file(str(issue.get("file") or ""), by_file) or only
+            if target:
+                issues_by_file[target].append(issue)
+        result: Dict[str, List[Finding]] = {}
+        for rel, entry in by_file.items():
+            result[rel] = self._to_findings({"issues": issues_by_file[rel]}, rel, entry["lines"], entry["shown"],
+                                            entry["changed"], language_of(rel) or "text")
+        return result, cached
+
+    @staticmethod
+    def _match_file(name: str, files: Dict[str, Any]) -> Optional[str]:
+        name = name.strip().strip("`").replace("\\", "/").lstrip("./")
+        if not name:
+            return None
+        if name in files:
+            return name
+        matches = [rel for rel in files if rel.endswith("/" + name) or name.endswith("/" + rel)]
+        return matches[0] if len(matches) == 1 else None
+
+    def review_file(self, root: Path, rel: str, changed: Set[int], base_ref: str) -> Tuple[List[Finding], int, bool]:
+        """Review one file on its own (used by tests and small tools)."""
         findings: List[Finding] = []
+        batches = self.plan_requests(root, [(rel, changed)])
         all_cached = True
-        for i, numbers in enumerate(chunks):
-            part = f"Part {i + 1} of {len(chunks)} of this file. " if len(chunks) > 1 else ""
-            intro = (f"Change: {rel} ({language}), compared with {base_ref}." if base_ref else
-                     f"File: {rel} ({language}). Whole-file review of existing code: every line is in scope.")
-            prompt = REVIEW_TEMPLATE.format(intro=intro, part=part,
-                                            code=render_chunk(lines, numbers, changed), focus=focus,
-                                            categories=" | ".join(f'"{c}"' for c in CATEGORIES))
-            data, cached = self.complete_json(REVIEW_SYSTEM, prompt)
+        for batch in batches:
+            result, cached = self.review_batch(batch, base_ref)
             all_cached = all_cached and cached
-            findings.extend(self._to_findings(data, rel, lines, set(numbers), changed, language))
-        return findings, len(chunks), all_cached and bool(chunks)
+            findings.extend(result.get(rel, []))
+        return findings, len(batches), all_cached and bool(batches)
 
     def _to_findings(self, data: Dict[str, Any], rel: str, lines: List[str], shown: Set[int],
                      changed: Set[int], language: str) -> List[Finding]:

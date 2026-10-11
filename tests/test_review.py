@@ -311,3 +311,121 @@ def test_zip_keeps_only_reviewable_files(tmp_path):
     assert files == ["reviewer.yml", "src/A.java"]
     with pytest.raises(UploadError, match="no source files"):
         extract_zip(make_zip(tmp_path / "bin.zip", {"a/b.class": "x"}), tmp_path / "out2", {}, keep)
+
+
+# ------------------------------------------------------------- batching and quotas
+from app.core.ai_review import QuotaExhausted, parse_retry_seconds  # noqa: E402
+
+
+def make_project(tmp_path, count, lines=3):
+    repo = tmp_path / "many"
+    (repo / "src").mkdir(parents=True)
+    for i in range(count):
+        body = "\n".join(f"    int f{j} = {j};" for j in range(lines))
+        (repo / "src" / f"C{i:03}.java").write_text(f"class C{i:03} {{\n{body}\n}}\n")
+    return repo
+
+
+def test_small_files_are_packed_into_few_requests(tmp_path, monkeypatch):
+    calls = fake_ai(monkeypatch, [])
+    repo = make_project(tmp_path, 120)
+    result = CodeReviewOrchestrator(str(repo), base_ref="", config_overrides={"ai": {"summary": False}}).run_full_review()
+    assert result.stats["files_reviewed"] == 120 and result.stats["files_skipped"] == 0
+    assert result.stats["requests"] == len(calls) == 3        # 40 files per request at most
+    assert "### File: src/C000.java" in calls[0] and "### File: src/C039.java" in calls[0]
+
+
+def test_issues_are_matched_to_their_file_in_a_batch(tmp_path, monkeypatch):
+    fake_ai(monkeypatch, [
+        {"file": "src/C001.java", "line": 2, "severity": "HIGH", "category": "bug", "title": "in one", "confidence": 0.9},
+        {"file": "C002.java", "line": 3, "severity": "LOW", "category": "bug", "title": "in two", "confidence": 0.9},
+        {"file": "elsewhere.java", "line": 2, "severity": "HIGH", "category": "bug", "title": "unknown", "confidence": 0.9},
+    ])
+    result = CodeReviewOrchestrator(str(make_project(tmp_path, 3)), base_ref="").run_full_review()
+    assert {(f.file_path, f.title) for f in result.findings} == {("src/C001.java", "in one"), ("src/C002.java", "in two")}
+    assert result.stats["requests"] == 1
+
+
+def test_large_file_is_split_across_requests(tmp_path, monkeypatch):
+    calls = fake_ai(monkeypatch, [])
+    repo = make_project(tmp_path, 1, lines=1200)
+    cfg = {"ai": {"summary": False, "max_lines_per_request": 500, "whole_file_up_to": 400}}
+    result = CodeReviewOrchestrator(str(repo), base_ref="", config_overrides=cfg).run_full_review()
+    assert len(calls) == result.stats["requests"] >= 3
+    assert "part 1 of" in calls[0]
+    assert result.files[0].status == "reviewed"
+
+
+def test_parse_retry_seconds():
+    assert parse_retry_seconds("Please retry in 22h3m18.4s.") == pytest.approx(22 * 3600 + 3 * 60 + 18.4)
+    assert parse_retry_seconds("Please retry in 25.3s") == pytest.approx(25.3)
+    assert parse_retry_seconds("'retryDelay': '41s'") == 41
+    assert parse_retry_seconds("nothing here") is None
+
+
+def test_quota_stops_the_review_and_keeps_partial_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test")
+    seen = []
+
+    def complete_json(self, system, user):
+        seen.append(user)
+        if len(seen) > 1:
+            raise QuotaExhausted("groq quota used up; it resets in about 22 hours.")
+        return {"issues": [{"file": "src/C000.java", "line": 2, "severity": "MEDIUM", "category": "bug",
+                            "title": "found", "confidence": 0.9}]}, False
+    monkeypatch.setattr(AIReviewer, "complete_json", complete_json)
+    cfg = {"ai": {"max_workers": 1, "max_lines_per_request": 50}}
+    result = CodeReviewOrchestrator(str(make_project(tmp_path, 30)), base_ref="", config_overrides=cfg).run_full_review()
+    statuses = [f.status for f in result.files]
+    assert statuses.count("reviewed") > 0 and statuses.count("skipped") > 0 and "error" not in statuses
+    assert all(f.message.startswith("AI quota") for f in result.files if f.status == "skipped")
+    assert [f.title for f in result.findings] == ["found"]
+    assert "partial review" in result.verdict_reason
+    assert len(seen) == 2                                      # stopped instead of failing every remaining request
+
+
+def test_quota_on_the_first_request_is_an_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test")
+
+    def complete_json(self, system, user):
+        raise QuotaExhausted("gemini quota used up; it resets in about 22 hours.")
+    monkeypatch.setattr(AIReviewer, "complete_json", complete_json)
+    with pytest.raises(RuntimeError, match="resets in about 22 hours"):
+        CodeReviewOrchestrator(str(make_project(tmp_path, 2)), base_ref="").run_full_review()
+
+
+def fake_client(replies):
+    class Completions:
+        def create(self, **kw):
+            reply = replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            msg = type("M", (), {"content": reply})
+            return type("R", (), {"choices": [type("C", (), {"message": msg})]})
+    return type("Client", (), {"chat": type("Chat", (), {"completions": Completions()})})
+
+
+class RateLimit(Exception):
+    status_code = 429
+
+
+def test_invalid_json_is_retried_once(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "test")
+    r = AIReviewer({"ai": {}})
+    replies = ['{"issues": [ broken', '{"issues": []}']
+    r._client = fake_client(replies)
+    assert r.complete_json("s", "u") == ({"issues": []}, False)
+    assert replies == []
+
+
+def test_short_rate_limit_waits_and_daily_limit_stops(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    slept = []
+    monkeypatch.setattr("app.core.ai_review.time.sleep", lambda s: slept.append(s))
+    r = AIReviewer({"ai": {}})
+    r._json_mode = False
+    r._client = fake_client([RateLimit("429 Please retry in 12s"), '{"issues": []}'])
+    assert r.complete_json("s", "a")[0] == {"issues": []} and slept == [12]
+    r._client = fake_client([RateLimit("429 Quota exceeded, limit: 20. Please retry in 22h3m1s")])
+    with pytest.raises(QuotaExhausted, match="about 22 hours"):
+        r.complete_json("s", "b")
