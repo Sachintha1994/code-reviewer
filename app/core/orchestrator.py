@@ -89,6 +89,17 @@ class CodeReviewOrchestrator:
             ctx.changed_lines = {p: set(lines) for p, lines in added.items()}
             ctx.extra["added_lines"] = added
             ctx.extra["diff_changed_lines"] = sum(len(v) for v in added.values()) + diff.removed_count
+        else:
+            self._emit("diff", "Full project scan (no base_ref provided)")
+            added = {}
+            for f in files:
+                rel = Path(f).relative_to(self.root).as_posix()
+                lines = read_lines(Path(f))
+                added[rel] = {i: text for i, text in enumerate(lines, 1)}
+            ctx.changed_lines = None  # means review all findings from scanners
+            ctx.extra["added_lines"] = added
+            ctx.extra["diff_changed_lines"] = sum(len(v) for v in added.values())
+
 
         self._emit("scan", f"Running scanners on {len(files)} files ({', '.join(languages) or 'no code'})")
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:

@@ -60,7 +60,7 @@ exclude:
 
 # Scanners to turn off completely, by name (as shown in the scan log), e.g. Trivy
 # stops dependency scanning of pom.xml / requirements.txt / package-lock.json.
-disabled_scanners: ["Trivy"]
+disabled_scanners: ["Trivy", "Maven", "ESLint", "PMD", "Build", "Semgrep", "SecretPatterns", "Lizard", "Bandit", "jscpd", "Change hygiene", "SonarQube", "Codecov", "GitHub Advanced Security", "Ruff", "pytest", "mypy"]
 
 # Only report findings on lines changed since this git ref (e.g. "main").
 # Leave empty to review the whole project. Can also be set per scan.

@@ -1,0 +1,55 @@
+# Code Reviewer settings.
+#
+# The reviewer compares a project with a base branch and asks an AI to review the
+# changed code. A project can override any of these values with its own
+# reviewer.yml in its root folder.
+
+# Branch or ref to compare with when a project or scan doesn't set one.
+base_ref: ""
+
+ai:
+  provider: ""              # gemini | groq | openai | ollama ; empty = pick from the API key in .env
+  model: ""                 # empty = the provider's default
+  max_files: 80             # changed files reviewed per scan; the rest are listed as skipped
+  max_lines_per_request: 600
+  whole_file_up_to: 400     # files up to this many lines are sent whole, larger ones as changed sections
+  context_lines: 25         # unchanged lines shown around each changed section
+  skip_files_with_more_changed_lines_than: 3000
+  min_confidence: 0.5       # issues the AI is less sure about are dropped
+  max_workers: 1            # AI requests sent in parallel
+  summary: true             # write a short summary of the whole change
+  # What to look for. Edit to match your team's standards.
+  focus:
+    - bugs and logic errors, including wrong edge cases and off-by-one errors
+    - security problems (injection, missing authorization or validation, leaked secrets, unsafe deserialization)
+    - error handling that hides failures or leaves things half done
+    - concurrency and transaction problems
+    - performance problems that matter (N+1 queries, work inside loops, unbounded memory)
+    - missing or weak tests for the changed behaviour
+    - maintainability problems a senior reviewer would raise (not formatting or naming nitpicks)
+
+# Folders and files that are never reviewed (glob patterns matched against
+# paths relative to the project root). Add more in a .reviewerignore file.
+exclude:
+  - .git
+  - venv
+  - .venv
+  - node_modules
+  - __pycache__
+  - dist
+  - build
+  - target
+  - vendor
+  - third_party
+  - "*.min.js"
+  - "*.min.css"
+  - "*.map"
+  - "*.lock"
+  - "package-lock.json"
+  - "*.generated.*"
+  - "*.pb.go"
+
+server:
+  # Local folders the dashboard may review. Empty = your home folder only.
+  # Can also be set with REVIEWER_ALLOWED_ROOTS (separate folders with ; on Windows).
+  allowed_roots: []
