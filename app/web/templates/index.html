@@ -43,6 +43,9 @@
     <symbol id="i-tool" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/></symbol>
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></symbol>
     <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
     <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="8" r="2"/><path d="M6 7v10M18 10c0 4-6 3-12 7"/></symbol>
   </svg>
 
@@ -59,6 +62,11 @@
       <nav id="projectList" class="project-list"></nav>
       <div class="sidebar-foot">
         <div class="ai-status" id="aiStatus"></div>
+        <div class="usage" id="usage" hidden title="Requests sent to the AI by this app in the last 24 hours">
+          <div class="usage-row"><span>AI requests, last 24 h</span><b id="usageCount">0</b></div>
+          <div class="meter" id="usageMeter" hidden><i id="usageBar"></i></div>
+        </div>
+        <button class="btn btn-ghost btn-sm w-full" id="aiSettingsBtn"><svg><use href="#i-gear"/></svg>AI settings</button>
         <div class="legend"><span class="dot dot-fail"></span>changes <span class="dot dot-warn"></span>comments <span class="dot dot-pass"></span>good</div>
       </div>
     </aside>
@@ -73,8 +81,18 @@
           <div class="meta" id="projectMeta"></div>
         </div>
         <div class="topbar-actions">
-          <button class="btn btn-ghost hide-sm" id="settingsBtn" hidden>Settings</button>
-          <button class="btn btn-ghost" id="pdfBtn" hidden><svg><use href="#i-file"/></svg><span class="hide-sm">Export PDF</span></button>
+          <button class="btn btn-ghost hide-sm" id="settingsBtn" hidden><svg><use href="#i-gear"/></svg>Project</button>
+          <div class="menu-wrap" id="exportGroup" hidden>
+            <button class="btn btn-ghost" id="exportBtn" aria-haspopup="true" aria-expanded="false"><svg><use href="#i-download"/></svg><span class="hide-sm">Export</span></button>
+            <div class="popover menu" id="exportMenu" hidden role="menu">
+              <button role="menuitem" data-export="pdf"><svg><use href="#i-file"/></svg><span>PDF report<small>to share or print</small></span></button>
+              <button role="menuitem" data-export="md"><svg><use href="#i-file"/></svg><span>Markdown<small>paste into a pull request</small></span></button>
+              <button role="menuitem" data-export="csv"><svg><use href="#i-layers"/></svg><span>CSV<small>open in Excel</small></span></button>
+              <button role="menuitem" data-export="json"><svg><use href="#i-file"/></svg><span>JSON<small>for scripts and CI</small></span></button>
+              <button role="menuitem" data-export="patch"><svg><use href="#i-tool"/></svg><span>Patch with all fixes<small>apply with git apply</small></span></button>
+              <label class="check small menu-check"><input type="checkbox" id="exportIgnored"> Include ignored issues</label>
+            </div>
+          </div>
           <div class="run-group" id="runGroup" hidden>
             <button class="btn btn-primary" id="runBtn" aria-label="Run review"><svg><use href="#i-sparkle"/></svg><span class="hide-sm">Run review</span></button>
             <button class="btn btn-primary btn-caret" id="runOptionsBtn" aria-label="Review options" aria-expanded="false"><svg><use href="#i-chevron"/></svg></button>
@@ -84,7 +102,10 @@
                 <input id="scanBaseRef" placeholder="e.g. main" autocomplete="off">
               </label>
               <button class="btn btn-primary w-full" id="runWithOptions">Review changes since this branch</button>
+              <div class="est muted small" id="estChanges"></div>
               <button class="btn btn-ghost w-full" id="runWholeProject">Review the whole project</button>
+              <div class="est muted small" id="estWhole"></div>
+              <button class="btn btn-ghost w-full" id="runChoose"><svg><use href="#i-folder"/></svg>Choose folders and files…</button>
             </div>
           </div>
           <button class="icon-btn" id="themeBtn" aria-label="Toggle dark mode"><svg><use href="#i-moon"/></svg></button>
@@ -121,6 +142,12 @@
         </div>
 
         <div id="results" hidden>
+          <div class="card banner" id="oldBanner" hidden>
+            <svg><use href="#i-clock"/></svg>
+            <span id="oldBannerText">You're looking at an older review.</span>
+            <span class="spacer"></span>
+            <button class="btn btn-primary btn-sm" id="backToLatest">Back to the latest review</button>
+          </div>
           <div class="summary">
             <article class="card verdict-card" id="verdictCard">
               <div class="card-label">Verdict</div>
@@ -144,6 +171,23 @@
             </article>
           </div>
 
+          <section class="insights" id="insights">
+            <article class="card compare-card" id="compareCard">
+              <div class="card-label">Since the previous review</div>
+              <div class="compare-stats">
+                <button class="cmp cmp-new" id="cmpNew" title="Show only new issues"><b id="cmpNewCount">0</b><span>new</span></button>
+                <button class="cmp cmp-fixed" id="cmpFixed" title="Show the fixed issues"><b id="cmpFixedCount">0</b><span>fixed</span></button>
+                <div class="cmp"><b id="cmpOpenCount">0</b><span>still open</span></div>
+              </div>
+              <div class="fixed-list" id="fixedList" hidden></div>
+              <div class="muted small" id="compareFoot"></div>
+            </article>
+            <article class="card trend-card">
+              <div class="card-label">Issues over time <span class="muted small">(click a point to open that review)</span></div>
+              <div class="chart-wrap" id="trendChart"></div>
+            </article>
+          </section>
+
           <section class="card summary-card" id="summaryCard">
             <div class="section-head">
               <h2><svg class="inline"><use href="#i-sparkle"/></svg>AI summary</h2>
@@ -164,6 +208,7 @@
                   <select id="catFilter" aria-label="Category"><option value="">All categories</option></select>
                 </div>
                 <div class="filter-row">
+                  <label class="check small" id="newOnlyLabel"><input type="checkbox" id="newOnly"> New only</label>
                   <label class="check small"><input type="checkbox" id="fixOnly"> With a suggested fix</label>
                   <label class="check small"><input type="checkbox" id="showHidden"> Show ignored <span id="hiddenCount"></span></label>
                   <button class="link-btn small" id="clearFilters">Clear filters</button>
@@ -218,6 +263,14 @@
         <label class="field" id="branchField"><span><svg class="inline"><use href="#i-branch"/></svg>Branch to compare with <em>(optional)</em></span>
           <input name="base_ref" placeholder="e.g. main or pm-dev" autocomplete="off">
           <small class="hint">With a branch, the AI reviews only what changed since it (including uncommitted work). Leave empty to review the whole project.</small></label>
+        <details class="sub-section" id="rulesSection">
+          <summary>Review rules for this project <em class="muted" id="rulesCount"></em></summary>
+          <label class="field"><span>Extra things the AI should check <em>(one per line)</em></span>
+            <textarea name="rules" rows="4" maxlength="4000" placeholder="Use constructor injection, not @Autowired fields&#10;Every REST endpoint must check the caller's role&#10;No System.out.println; use the logger"></textarea>
+            <small class="hint">Added to the focus list in AI settings, for this project only.</small></label>
+          <label class="field"><span>Also skip these files <em>(glob patterns, one per line)</em></span>
+            <textarea name="extra_exclude" rows="3" maxlength="4000" placeholder="src/main/java/**/generated/**&#10;*Test.java"></textarea></label>
+        </details>
         <div class="form-error" id="projectError" role="alert" hidden></div>
       </div>
       <footer class="modal-foot">
@@ -241,6 +294,91 @@
       <footer class="modal-foot"><span class="spacer"></span>
         <button type="button" class="btn btn-ghost" data-close>Cancel</button>
         <button type="submit" class="btn btn-primary" value="ok">Confirm</button></footer>
+    </form>
+  </dialog>
+
+  <!-- Choose files -->
+  <dialog class="modal modal-lg" id="selectModal">
+    <form method="dialog" id="selectForm">
+      <header class="modal-head">
+        <div><h2>Choose what to review</h2><div class="muted small" id="selectScope"></div></div>
+        <button type="button" class="icon-btn" data-close aria-label="Close"><svg><use href="#i-x"/></svg></button>
+      </header>
+      <div class="modal-body select-body">
+        <div class="select-tools">
+          <div class="search"><svg><use href="#i-search"/></svg><input id="selectSearch" placeholder="Filter by file or folder name" autocomplete="off"></div>
+          <button type="button" class="btn btn-ghost btn-sm" id="selectAll">Select all</button>
+          <button type="button" class="btn btn-ghost btn-sm" id="selectNone">Clear</button>
+        </div>
+        <div class="tree" id="tree" role="tree" aria-label="Project files"></div>
+      </div>
+      <footer class="modal-foot">
+        <div class="select-est" id="selectEstimate" aria-live="polite"></div>
+        <span class="spacer"></span>
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="selectRun" value="ok"><svg><use href="#i-sparkle"/></svg>Review selected</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- AI settings -->
+  <dialog class="modal modal-lg" id="settingsModal">
+    <form method="dialog" id="settingsForm" novalidate>
+      <header class="modal-head">
+        <h2>AI settings</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close"><svg><use href="#i-x"/></svg></button>
+      </header>
+      <div class="modal-body">
+        <section class="set-section">
+          <h3>Model</h3>
+          <div class="set-grid">
+            <label class="field"><span>Provider</span>
+              <select name="provider" id="setProvider"></select></label>
+            <label class="field"><span>Model <em>(empty = provider default)</em></span>
+              <input name="model" id="setModel" maxlength="100" autocomplete="off"></label>
+          </div>
+          <div class="row">
+            <button type="button" class="btn btn-ghost btn-sm" id="testAiBtn"><svg><use href="#i-check"/></svg>Test saved settings</button>
+            <span class="small" id="testAiResult"></span>
+          </div>
+          <small class="hint">API keys stay in the .env file and are never shown or saved here. A test uses one AI request.</small>
+        </section>
+        <section class="set-section">
+          <h3>What the AI looks for</h3>
+          <label class="field"><span>Focus areas <em>(one per line)</em></span>
+            <textarea name="focus" rows="6"></textarea></label>
+          <div class="set-grid">
+            <label class="field"><span>Minimum confidence <output id="confOut"></output></span>
+              <input type="range" name="min_confidence" min="0" max="1" step="0.05"></label>
+            <label class="check"><input type="checkbox" name="summary"> Write a summary of the whole review</label>
+          </div>
+        </section>
+        <section class="set-section">
+          <h3>Size and speed</h3>
+          <div class="set-grid set-grid-3">
+            <label class="field"><span>Lines per AI request <em>(0 = auto)</em></span><input type="number" name="max_lines_per_request" min="0" max="20000"></label>
+            <label class="field"><span>Requests in parallel</span><input type="number" name="max_workers" min="1" max="16"></label>
+            <label class="field"><span>Max files per review</span><input type="number" name="max_files" min="1" max="20000"></label>
+            <label class="field"><span>Send files whole up to <em>(lines)</em></span><input type="number" name="whole_file_up_to" min="0" max="20000"></label>
+            <label class="field"><span>Context lines around changes</span><input type="number" name="context_lines" min="0" max="200"></label>
+            <label class="field"><span>Daily request limit <em>(0 = none)</em></span><input type="number" name="daily_request_limit" min="0" max="1000000"></label>
+          </div>
+          <small class="hint">Packing more lines into each request uses fewer requests (good for free tiers like Gemini's 20 a day). The daily limit only drives the meter in the sidebar.</small>
+        </section>
+        <section class="set-section">
+          <h3>Never review</h3>
+          <label class="field"><span>Exclude patterns <em>(one per line)</em></span>
+            <textarea name="exclude" rows="5" class="mono-input"></textarea></label>
+        </section>
+        <div class="form-error" id="settingsError" role="alert" hidden></div>
+        <small class="hint" id="settingsFile"></small>
+      </div>
+      <footer class="modal-foot">
+        <button type="button" class="btn btn-danger-ghost" id="resetSettingsBtn"><svg><use href="#i-undo"/></svg>Reset to reviewer.yml</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
+        <button type="submit" class="btn btn-primary" id="saveSettingsBtn">Save settings</button>
+      </footer>
     </form>
   </dialog>
 

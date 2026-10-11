@@ -44,6 +44,7 @@ class Finding(BaseModel):
     language: Optional[str] = None
     fingerprint: str = ""
     suppressed: Optional[str] = None          # reason, when ignored inline or by a user
+    is_new: Optional[bool] = None             # not in the previous review (None = nothing to compare with)
 
     @property
     def counts(self) -> bool:

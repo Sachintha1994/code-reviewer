@@ -97,9 +97,11 @@
   // ------------------------------------------------------------------ state
   const state = {
     projects: [], project: null, scan: null, result: null, selected: null,
-    filters: { sev: new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']), cat: '', q: '', fixOnly: false, showHidden: false, file: '' },
+    filters: { sev: new Set(['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']), cat: '', q: '', fixOnly: false, showHidden: false, file: '', newOnly: false },
     openFiles: new Set(), stream: null, pollTimer: null, suppressTarget: null, ai: null,
+    latestId: null, viewingOld: false, history: [],
   };
+  const fmt = (n) => Number(n || 0).toLocaleString();
 
   // ------------------------------------------------------------------ theme
   function currentTheme() {
@@ -140,6 +142,22 @@
     box.append(el('span', { class: `dot ${ok ? 'dot-pass' : 'dot-fail'}` }),
       el('span', { text: ok ? `AI: ${state.ai.provider} / ${state.ai.model}` : `AI not set up: ${state.ai.reason}` }));
     box.title = ok ? '' : state.ai.reason;
+    renderUsage();
+  }
+
+  function renderUsage() {
+    const ai = state.ai;
+    show($('#usage'), Boolean(ai && ai.available));
+    if (!ai || !ai.available) return;
+    const used = ai.requests_24h || 0;
+    const limit = ai.daily_request_limit || 0;
+    $('#usageCount').textContent = limit ? `${fmt(used)} / ${fmt(limit)}` : fmt(used);
+    show($('#usageMeter'), limit > 0);
+    if (limit) {
+      const pct = Math.min(100, (100 * used) / limit);
+      $('#usageBar').style.width = `${pct}%`;
+      $('#usageMeter').className = `meter${pct >= 100 ? ' full' : pct >= 75 ? ' high' : ''}`;
+    }
   }
 
   async function loadProjects() {
@@ -173,7 +191,7 @@
     $('#projectName').textContent = p ? p.name : 'Welcome';
     show($('#runGroup'), Boolean(p));
     show($('#settingsBtn'), Boolean(p));
-    show($('#pdfBtn'), Boolean(p && state.result));
+    show($('#exportGroup'), Boolean(p && state.result));
     if (!p) return;
     const srcIcon = { github: 'github', zip: 'layers' }[p.source_type] || 'folder';
     show($('#runOptionsBtn'), p.source_type !== 'zip');   // a ZIP is always reviewed whole
@@ -181,7 +199,9 @@
       p.path_or_url.length > 60 ? `…${p.path_or_url.slice(-58)}` : p.path_or_url));
     const ref = state.result ? state.result.base_ref : p.base_ref;
     meta.append(el('span', null, icon('branch'), ref ? `changes since ${ref}` : 'whole project'));
-    if (state.scan && state.scan.finished_at) meta.append(el('span', null, `reviewed ${timeAgo(state.scan.finished_at)}`));
+    if (state.scan && state.scan.finished_at) meta.append(el('span', null, icon('clock'), `reviewed ${timeAgo(state.scan.finished_at)}`));
+    const sel = state.result && state.result.stats && state.result.stats.selection;
+    if (sel && sel.length) meta.append(el('span', { title: `Reviewed only:\n${sel.join('\n')}` }, icon('folder'), sel.length === 1 ? `only ${sel[0]}` : 'selected files only'));
     $('#scanBaseRef').value = p.base_ref || '';
   }
 
@@ -197,7 +217,7 @@
     stopWatching();
     const p = state.projects.find((x) => x.id === id);
     if (!p) return;
-    Object.assign(state, { project: p, scan: null, result: null, selected: null });
+    Object.assign(state, { project: p, scan: null, result: null, selected: null, latestId: null, viewingOld: false, history: [] });
     state.openFiles.clear();
     resetFilters(false);
     try { history.replaceState(null, '', `#/p/${id}`); } catch (e) { /* ignore */ }
@@ -217,10 +237,12 @@
     const p = state.project;
     let data;
     try { data = await api('GET', `/api/projects/${p.id}/latest`); } catch (e) { toast(e.message, 'error'); return; }
-    if (state.project !== p) return;
+    if (!state.project || state.project.id !== p.id) return;
     const scan = data.scan;
     state.scan = scan;
     state.result = null;
+    state.viewingOld = false;
+    state.latestId = scan && scan.status === 'done' ? scan.id : null;
     if (!scan) { renderTopbar(); noScan('No review yet', 'Run the first review to see what the AI finds in your changes.'); return; }
     if (scan.status === 'running') { watchScan(scan.id); return; }
     if (scan.status === 'error') {
@@ -239,7 +261,28 @@
     renderTopbar();
     showView('results');
     renderResult();
+    loadHistory();
   }
+
+  async function loadHistory() {
+    const p = state.project;
+    try { state.history = await api('GET', `/api/projects/${p.id}/history`); } catch (e) { state.history = []; }
+    if (state.project && state.project.id === p.id) renderTrend();
+  }
+
+  async function openScan(id) {
+    if (state.scan && state.scan.id === id) return;
+    if (id === state.latestId) { loadLatest(); return; }
+    let scan;
+    try { scan = await api('GET', `/api/scans/${id}`); } catch (e) { toast(e.message, 'error'); return; }
+    if (!scan.result || !scan.result.files) { toast('That review was made by an older version and can\'t be shown.', 'error'); return; }
+    Object.assign(state, { scan, result: scan.result, viewingOld: true, selected: null });
+    renderTopbar();
+    showView('results');
+    renderResult();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  $('#backToLatest').addEventListener('click', () => loadLatest());
 
   // ------------------------------------------------------------------ running a review
   async function runScan(options) {
@@ -290,11 +333,12 @@
       stopWatching();
       if (event.status === 'error') toast(`Review failed: ${event.message || 'see details'}`, 'error');
       else toast('Review finished');
+      loadAiStatus();
       loadProjects().then(() => {
         if (state.project) state.project = state.projects.find((x) => x.id === state.project.id) || state.project;
         renderProjects();
+        if (state.project) loadLatest();
       });
-      loadLatest();
     }
   }
 
@@ -307,7 +351,7 @@
     $('#progressMsg').textContent = 'Starting';
     renderProgress();
     showView('progress');
-    show($('#pdfBtn'), false);
+    show($('#exportGroup'), false);
     if (window.EventSource) {
       const es = new EventSource(`/api/scans/${scanId}/events`);
       state.stream = es;
@@ -334,8 +378,47 @@
     const pop = $('#runOptions');
     pop.hidden = !pop.hidden;
     $('#runOptionsBtn').setAttribute('aria-expanded', String(!pop.hidden));
-    if (!pop.hidden) $('#scanBaseRef').focus();
+    if (!pop.hidden) { $('#scanBaseRef').focus(); refreshEstimates(); }
   });
+
+  // ------------------------------------------------------------------ request estimates
+  function estimateText(est) {
+    if (!est.files) return 'Nothing to review.';
+    return `${plural(est.files, 'file')} · ${fmt(est.lines)} lines · about ${plural(est.requests, 'AI request')}`;
+  }
+
+  function quotaWarning(requests) {
+    const ai = state.ai;
+    if (!ai || !ai.daily_request_limit) return '';
+    const left = ai.daily_request_limit - (ai.requests_24h || 0);
+    return requests > left ? ` (more than the ${Math.max(0, left)} left today; it will stop and continue on the next run)` : '';
+  }
+
+  async function estimate(body) {
+    return api('POST', `/api/projects/${state.project.id}/estimate`, body);
+  }
+
+  let estTimer = null;
+  let estSeq = 0;
+  function refreshEstimates() {
+    clearTimeout(estTimer);
+    const ref = $('#scanBaseRef').value.trim();
+    const seq = ++estSeq;
+    $('#estChanges').textContent = ref ? 'Estimating…' : 'Enter a branch to compare with.';
+    $('#estWhole').textContent = 'Estimating…';
+    estTimer = setTimeout(async () => {
+      const jobs = [estimate({ whole_project: true }).then((e) => {
+        if (seq === estSeq) $('#estWhole').textContent = estimateText(e) + quotaWarning(e.requests);
+      }).catch((e) => { if (seq === estSeq) $('#estWhole').textContent = e.message; })];
+      if (ref) {
+        jobs.push(estimate({ base_ref: ref }).then((e) => {
+          if (seq === estSeq) $('#estChanges').textContent = estimateText(e) + quotaWarning(e.requests);
+        }).catch((e) => { if (seq === estSeq) $('#estChanges').textContent = e.message; }));
+      }
+      await Promise.all(jobs);
+    }, 350);
+  }
+  $('#scanBaseRef').addEventListener('input', refreshEstimates);
   document.addEventListener('click', (e) => {
     const pop = $('#runOptions');
     if (!pop.hidden && !pop.contains(e.target)) { pop.hidden = true; $('#runOptionsBtn').setAttribute('aria-expanded', 'false'); }
@@ -349,9 +432,57 @@
     $('#runOptions').hidden = true;
     runScan({ whole_project: true });
   });
-  $('#pdfBtn').addEventListener('click', () => {
-    if (state.scan) window.open(`/api/scans/${state.scan.id}/report.pdf`, '_blank', 'noopener');
+  $('#runChoose').addEventListener('click', () => {
+    $('#runOptions').hidden = true;
+    const ref = state.project.source_type === 'zip' ? '' : $('#scanBaseRef').value.trim();
+    openSelect(ref);
   });
+  // ------------------------------------------------------------------ export
+  function togglePopover(pop, btn, on) {
+    pop.hidden = !on;
+    btn.setAttribute('aria-expanded', String(on));
+  }
+  $('#exportBtn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    togglePopover($('#exportMenu'), $('#exportBtn'), $('#exportMenu').hidden);
+  });
+  document.addEventListener('click', (e) => {
+    const pop = $('#exportMenu');
+    if (!pop.hidden && !pop.contains(e.target)) togglePopover(pop, $('#exportBtn'), false);
+  });
+
+  async function download(url) {
+    const res = await fetch(url);
+    if (!res.ok) {
+      let msg = `Export failed (${res.status})`;
+      try { msg = (await res.json()).detail || msg; } catch (e) { /* not JSON */ }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const name = (/filename="([^"]+)"/.exec(res.headers.get('Content-Disposition') || '') || [])[1] || 'review';
+    const link = el('a', { href: URL.createObjectURL(blob), download: name });
+    document.body.append(link);
+    link.click();
+    setTimeout(() => { URL.revokeObjectURL(link.href); link.remove(); }, 1000);
+    return res;
+  }
+
+  document.querySelectorAll('[data-export]').forEach((btn) => btn.addEventListener('click', async () => {
+    togglePopover($('#exportMenu'), $('#exportBtn'), false);
+    if (!state.scan) return;
+    const kind = btn.dataset.export;
+    if (kind === 'pdf') { window.open(`/api/scans/${state.scan.id}/report.pdf`, '_blank', 'noopener'); return; }
+    const ignored = $('#exportIgnored').checked ? '?ignored=true' : '';
+    try {
+      const res = await download(`/api/scans/${state.scan.id}/export/${kind}${ignored}`);
+      if (kind === 'patch') {
+        const applied = Number(res.headers.get('X-Fixes-Applied') || 0);
+        const skipped = Number(res.headers.get('X-Fixes-Skipped') || 0);
+        toast(applied ? `Patch has ${plural(applied, 'fix')}${skipped ? `; ${skipped} left out because the code changed or they overlap` : ''}. Apply with: git apply --3way`
+          : 'No fixes could be applied: the code changed since the review, or no issue has a fix.', applied ? '' : 'error');
+      } else toast('Export downloaded');
+    } catch (e) { toast(e.message, 'error'); }
+  }));
 
   // ------------------------------------------------------------------ results
   function renderResult() {
@@ -361,6 +492,9 @@
     renderChange(r);
     renderSeverity(r);
     renderSummary(r);
+    renderBanner();
+    renderCompare(r);
+    renderTrend();
     renderCategoryOptions(r);
     renderFindings();
     renderFiles(r);
@@ -388,6 +522,7 @@
     if (s.files_skipped) extra.push(`${s.files_skipped} skipped`);
     if (s.files_failed) extra.push(`${s.files_failed} failed`);
     if (s.cached_files) extra.push(`${s.cached_files} from cache`);
+    if (s.selection && s.selection.length) extra.unshift('selected files only');
     $('#changeFoot').textContent = `${r.base_ref ? `compared with ${r.base_ref}` : 'whole project'}${extra.length ? ` · ${extra.join(' · ')}` : ''}`;
   }
 
@@ -410,6 +545,110 @@
       }, el('b', { class: `c-${s}`, text: counts[s] }), el('span', { text: sevLabel(s) })));
       if (total && counts[s]) bar.append(el('i', { class: `b-${s}`, style: { width: `${(100 * counts[s]) / total}%` } }));
     }
+  }
+
+  function renderBanner() {
+    show($('#oldBanner'), state.viewingOld);
+    if (state.viewingOld && state.scan) {
+      const when = new Date(state.scan.finished_at || state.scan.started_at);
+      $('#oldBannerText').textContent = `You're looking at an older review, from ${when.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })}. Ignoring issues works on the latest review only.`;
+    }
+  }
+
+  // ------------------------------------------------------------------ comparison and trend
+  function renderCompare(r) {
+    const cmp = r.comparison;
+    const card = $('#compareCard');
+    clear($('#fixedList'));
+    show($('#fixedList'), false);
+    $('#cmpFixed').classList.remove('active');
+    show($('#newOnlyLabel'), Boolean(cmp));
+    if (!cmp) {
+      card.classList.add('no-compare');
+      $('#cmpNewCount').textContent = '–';
+      $('#cmpFixedCount').textContent = '–';
+      $('#cmpOpenCount').textContent = '–';
+      $('#compareFoot').textContent = 'This is the first review of this project. The next one will show what is new and what got fixed.';
+      return;
+    }
+    card.classList.remove('no-compare');
+    const live = r.findings.filter((f) => !isHidden(f));
+    const fresh = live.filter((f) => f.is_new).length;
+    $('#cmpNewCount').textContent = fresh;
+    $('#cmpFixedCount').textContent = cmp.fixed.length;
+    $('#cmpOpenCount').textContent = live.length - fresh;
+    $('#cmpNew').classList.toggle('active', state.filters.newOnly);
+    $('#cmpNew').disabled = !fresh;
+    $('#cmpFixed').disabled = !cmp.fixed.length;
+    const prev = cmp.previous_finished_at ? timeAgo(cmp.previous_finished_at) : 'before';
+    $('#compareFoot').textContent = `Compared with the review from ${prev} (${plural(cmp.previous_issues || 0, 'issue')}).`;
+    const list = $('#fixedList');
+    for (const f of cmp.fixed.slice(0, 200)) {
+      list.append(el('div', { class: 'fixed-item' }, el('span', { class: `sev b-${f.severity}`, text: f.severity === 'CRITICAL' ? 'CRIT' : f.severity }),
+        el('span', { class: 'fixed-title', text: f.title }), el('span', { class: 'mono muted', text: `${f.file_path}:${f.line}` })));
+    }
+  }
+
+  $('#cmpNew').addEventListener('click', () => {
+    state.filters.newOnly = !state.filters.newOnly;
+    $('#newOnly').checked = state.filters.newOnly;
+    $('#cmpNew').classList.toggle('active', state.filters.newOnly);
+    renderFindings();
+    if (state.filters.newOnly) $('#findingList').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
+  $('#cmpFixed').addEventListener('click', () => {
+    const list = $('#fixedList');
+    show(list, list.hidden);
+    $('#cmpFixed').classList.toggle('active', !list.hidden);
+  });
+
+  function svg(tag, attrs, ...children) {
+    const node = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+    for (const c of children) node.append(c instanceof Node ? c : document.createTextNode(String(c)));
+    return node;
+  }
+
+  function renderTrend() {
+    const box = clear($('#trendChart'));
+    const hist = state.history || [];
+    if (hist.length < 2) {
+      box.append(el('div', { class: 'chart-empty', text: hist.length ? 'Run another review to start the trend.' : 'No finished reviews yet.' }));
+      return;
+    }
+    const W = 560; const H = 170; const L = 34; const R = 14; const T = 14; const B = 26;
+    const max = Math.max(4, ...hist.map((h) => h.issues || 0));
+    const step = hist.length > 1 ? (W - L - R) / (hist.length - 1) : 0;
+    const x = (i) => L + i * step;
+    const y = (v) => T + (H - T - B) * (1 - v / max);
+    const chart = svg('svg', { viewBox: `0 0 ${W} ${H}`, class: 'chart', role: 'img', 'aria-label': 'Number of issues in each review' });
+    [0, 0.5, 1].forEach((t) => {
+      const v = Math.round(max * t);
+      chart.append(svg('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), class: 'grid' }),
+        svg('text', { x: L - 8, y: y(v) + 4, 'text-anchor': 'end', class: 'tick' }, v));
+    });
+    const pts = hist.map((h, i) => `${x(i)},${y(h.issues || 0)}`);
+    chart.append(svg('path', { d: `M${x(0)},${y(0)} L${pts.join(' L')} L${x(hist.length - 1)},${y(0)} Z`, class: 'area' }),
+      svg('path', { d: `M${pts.join(' L')}`, class: 'line' }));
+    const day = (iso) => new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' });
+    chart.append(svg('text', { x: x(0), y: H - 6, 'text-anchor': 'start', class: 'tick' }, day(hist[0].finished_at)),
+      svg('text', { x: x(hist.length - 1), y: H - 6, 'text-anchor': 'end', class: 'tick' }, day(hist[hist.length - 1].finished_at)));
+    hist.forEach((h, i) => {
+      const current = state.scan && state.scan.id === h.id;
+      const sev = h.by_severity || {};
+      const tip = `${new Date(h.finished_at).toLocaleString()}\n${h.verdict_label || h.verdict}: ${plural(h.issues || 0, 'issue')}`
+        + ` (${sev.CRITICAL || 0} critical, ${sev.HIGH || 0} high)\n${h.base_ref ? `changes since ${h.base_ref}` : 'whole project'}`
+        + `${h.selection ? ', selected files only' : ''}`;
+      const g = svg('g', { class: 'pt-hit', tabindex: '0', role: 'button', 'aria-label': tip.replace(/\n/g, '. ') },
+        svg('title', null, tip),
+        svg('circle', { cx: x(i), cy: y(h.issues || 0), r: 12, class: 'hit' }),
+        svg('circle', { cx: x(i), cy: y(h.issues || 0), r: current ? 6.5 : 4.5,
+          class: `pt v-${h.verdict}${current ? ' current' : ''}${h.selection ? ' partial' : ''}` }));
+      g.addEventListener('click', () => openScan(h.id));
+      g.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openScan(h.id); } });
+      chart.append(g);
+    });
+    box.append(chart);
   }
 
   function renderSummary(r) {
@@ -440,8 +679,10 @@
   }
 
   function resetFilters(render = true) {
-    state.filters = { sev: new Set(SEVERITIES), cat: '', q: '', fixOnly: false, showHidden: false, file: '' };
+    state.filters = { sev: new Set(SEVERITIES), cat: '', q: '', fixOnly: false, showHidden: false, file: '', newOnly: false };
     $('#searchInput').value = '';
+    $('#newOnly').checked = false;
+    $('#cmpNew').classList.remove('active');
     $('#fixOnly').checked = false;
     $('#showHidden').checked = false;
     if (render) syncFilters();
@@ -462,6 +703,11 @@
   });
   $('#catFilter').addEventListener('change', (e) => { state.filters.cat = e.target.value; syncFilters(); });
   $('#fixOnly').addEventListener('change', (e) => { state.filters.fixOnly = e.target.checked; renderFindings(); });
+  $('#newOnly').addEventListener('change', (e) => {
+    state.filters.newOnly = e.target.checked;
+    $('#cmpNew').classList.toggle('active', e.target.checked);
+    renderFindings();
+  });
   $('#showHidden').addEventListener('change', (e) => { state.filters.showHidden = e.target.checked; renderFindings(); });
   $('#clearFilters').addEventListener('click', () => resetFilters(true));
 
@@ -472,6 +718,7 @@
     if (flt.cat && f.category !== flt.cat) return false;
     if (flt.file && f.file_path !== flt.file) return false;
     if (flt.fixOnly && !f.fix) return false;
+    if (flt.newOnly && !f.is_new) return false;
     if (flt.q && !`${f.title} ${f.file_path} ${f.explanation}`.toLowerCase().includes(flt.q)) return false;
     return true;
   }
@@ -487,7 +734,7 @@
     $('#findingCount').textContent = visible.length === r.findings.length ? r.findings.length : `${visible.length} of ${r.findings.length}`;
 
     if (!visible.length) {
-      const msg = r.findings.length ? 'No issues match these filters.' : 'The AI found no issues in the changed code.';
+      const msg = r.findings.length ? 'No issues match these filters.' : `The AI found no issues in the ${r.base_ref ? 'changed code' : 'project'}.`;
       list.append(el('div', { class: 'list-empty' }, msg, r.findings.length ? el('div', null,
         el('button', { class: 'link-btn small', text: 'Clear filters', onclick: () => resetFilters(true) })) : null));
       return;
@@ -523,6 +770,7 @@
 
   function findingRow(f) {
     const sub = [el('span', { class: 'line', text: `L${lineRange(f)}` }), el('span', { text: CATEGORY_LABEL[f.category] || f.category })];
+    if (f.is_new && state.result && state.result.comparison) sub.push(el('span', { class: 'tag fresh', text: 'new' }));
     if (f.fix) sub.push(el('span', { class: 'tag new' }, icon('sparkle'), 'fix'));
     if (f.suppressed) sub.push(el('span', { class: 'tag', text: 'ignored' }));
     return el('button', {
@@ -641,6 +889,7 @@
     body.append(el('div', { class: 'detail-meta' }, el('span', { class: 'mono', text: location }),
       el('button', { class: 'link-btn small', onclick: () => copyText(location, 'Location') }, icon('copy'), 'Copy location')));
     if (f.suppressed) body.append(el('div', { class: 'note', text: `Ignored: ${f.suppressed}` }));
+    if (f.is_new && state.result.comparison) body.append(el('div', { class: 'note fresh-note', text: 'New since the previous review.' }));
     if (f.explanation) body.append(el('div', { class: 'ai-box' }, el('div', { text: f.explanation })));
 
     if (f.fix) {
@@ -653,7 +902,9 @@
 
     const actions = el('div', { class: 'detail-actions' });
     const userSuppressed = f.suppressed && /^(marked false positive|ignored)/.test(f.suppressed);
-    if (userSuppressed) {
+    if (state.viewingOld) {
+      actions.append(el('span', { class: 'muted small', text: 'Open the latest review to ignore or restore issues.' }));
+    } else if (userSuppressed) {
       actions.append(el('button', { class: 'btn btn-ghost btn-sm', onclick: () => unsuppress(f) }, icon('undo'), 'Restore issue'));
     } else if (!f.suppressed) {
       actions.append(el('button', { class: 'btn btn-ghost btn-sm', onclick: () => askSuppress(f, 'false_positive') }, icon('flag'), 'False positive'));
@@ -696,6 +947,7 @@
       renderResult();
       toast(before !== state.result.verdict_label ? `${message}. Verdict is now "${state.result.verdict_label}".` : message);
       loadProjects();
+      loadHistory();
     } catch (e) { toast(e.message, 'error'); }
   }
 
@@ -720,6 +972,290 @@
         el('div', { class: 'muted', text: f.message || (f.cached ? 'from cache' : '') }));
     }
   }
+
+  // ------------------------------------------------------------------ choose files
+  const sel = { files: [], byPath: new Map(), root: null, chosen: new Set(), open: new Set(), base: '', q: '' };
+
+  function buildTree(files) {
+    const root = { name: '', path: '', dirs: new Map(), files: [] };
+    for (const f of files) {
+      const parts = f.path.split('/');
+      let node = root;
+      parts.slice(0, -1).forEach((part, i) => {
+        if (!node.dirs.has(part)) node.dirs.set(part, { name: part, path: parts.slice(0, i + 1).join('/'), dirs: new Map(), files: [] });
+        node = node.dirs.get(part);
+      });
+      node.files.push(f);
+    }
+    // collapse single-child folder chains (src/main/java/com/acme → one row)
+    const squash = (node) => {
+      for (const [key, child] of [...node.dirs]) {
+        let c = child;
+        while (c.files.length === 0 && c.dirs.size === 1) {
+          const only = [...c.dirs.values()][0];
+          c = { ...only, name: `${c.name}/${only.name}` };
+        }
+        node.dirs.set(key, c);
+        squash(c);
+      }
+    };
+    squash(root);
+    const tally = (node) => {
+      node.all = [...node.files.filter((f) => f.reviewable)];
+      node.lines = node.all.reduce((a, f) => a + f.lines, 0);
+      for (const d of node.dirs.values()) { tally(d); node.all.push(...d.all); node.lines += d.lines; }
+    };
+    tally(root);
+    return root;
+  }
+
+  function folderState(node) {
+    let on = 0;
+    for (const f of node.all) if (sel.chosen.has(f.path)) on += 1;
+    return on === 0 ? 'none' : on === node.all.length ? 'all' : 'some';
+  }
+
+  function checkbox(stateName, onChange, disabled) {
+    const box = el('input', { type: 'checkbox', disabled: disabled || null, tabindex: '-1' });
+    box.checked = stateName === 'all';
+    box.indeterminate = stateName === 'some';
+    box.addEventListener('change', onChange);
+    return box;
+  }
+
+  function fileRow(f, depth, showPath) {
+    const on = sel.chosen.has(f.path);
+    return el('label', { class: `tree-row file${f.reviewable ? '' : ' disabled'}`, style: { paddingLeft: `${8 + depth * 18}px` }, title: f.note || f.path },
+      checkbox(on ? 'all' : 'none', (e) => { if (e.target.checked) sel.chosen.add(f.path); else sel.chosen.delete(f.path); afterSelect(); }, !f.reviewable),
+      icon('file'), el('span', { class: 'tree-name' }, el('bdi', { text: showPath ? f.path : f.path.split('/').pop() })),
+      el('span', { class: 'tree-meta', text: f.reviewable ? `${fmt(f.lines)} lines` : (f.note || 'skipped') }));
+  }
+
+  function folderRows(node, depth, out) {
+    const dirs = [...node.dirs.values()].sort((a, b) => a.name.localeCompare(b.name));
+    for (const d of dirs) {
+      const open = sel.open.has(d.path);
+      const st = folderState(d);
+      const row = el('div', { class: `tree-row folder${open ? ' open' : ''}`, style: { paddingLeft: `${8 + depth * 18}px` }, role: 'treeitem', 'aria-expanded': String(open) },
+        el('button', { type: 'button', class: 'tree-toggle', 'aria-label': open ? 'Collapse' : 'Expand',
+          onclick: () => { if (open) sel.open.delete(d.path); else sel.open.add(d.path); renderTree(); } }, icon('chevron')),
+        checkbox(st, (e) => { for (const f of d.all) { if (e.target.checked) sel.chosen.add(f.path); else sel.chosen.delete(f.path); } afterSelect(); }, !d.all.length),
+        icon('folder'),
+        el('button', { type: 'button', class: 'tree-name link', onclick: () => { if (open) sel.open.delete(d.path); else sel.open.add(d.path); renderTree(); } }, el('bdi', { text: d.name })),
+        el('span', { class: 'tree-meta', text: `${plural(d.all.length, 'file')} · ${fmt(d.lines)} lines` }));
+      out.push(row);
+      if (open) folderRows(d, depth + 1, out);
+    }
+    for (const f of [...node.files].sort((a, b) => a.path.localeCompare(b.path))) out.push(fileRow(f, depth, false));
+  }
+
+  function renderTree() {
+    const box = clear($('#tree'));
+    if (!sel.root) return;
+    const rows = [];
+    if (sel.q) {
+      const hits = sel.files.filter((f) => f.path.toLowerCase().includes(sel.q));
+      hits.slice(0, 400).forEach((f) => rows.push(fileRow(f, 0, true)));
+      if (!hits.length) rows.push(el('div', { class: 'list-empty', text: 'No files match.' }));
+      if (hits.length > 400) rows.push(el('div', { class: 'muted small tree-more', text: `${hits.length - 400} more; narrow the filter.` }));
+    } else folderRows(sel.root, 0, rows);
+    box.append(...rows);
+  }
+
+  // smallest list of paths that covers the selection: whole folders where possible
+  function compactSelection() {
+    const out = [];
+    const walk = (node) => {
+      const st = folderState(node);
+      if (st === 'none') return;
+      if (st === 'all' && node.path) { out.push(node.path); return; }
+      for (const d of node.dirs.values()) walk(d);
+      for (const f of node.files) if (sel.chosen.has(f.path)) out.push(f.path);
+    };
+    walk(sel.root);
+    return out;
+  }
+
+  let selTimer = null;
+  let selSeq = 0;
+  function afterSelect() {
+    renderTree();
+    const total = sel.root ? sel.root.all.length : 0;
+    const n = sel.chosen.size;
+    $('#selectRun').disabled = n === 0;
+    $('#selectRun').lastChild.textContent = n === total ? 'Review all' : `Review ${plural(n, 'file')}`;
+    const box = $('#selectEstimate');
+    if (!n) { box.textContent = 'Nothing selected.'; return; }
+    box.textContent = `${plural(n, 'file')} selected · estimating…`;
+    clearTimeout(selTimer);
+    const seq = ++selSeq;
+    selTimer = setTimeout(async () => {
+      try {
+        const est = await estimate({ base_ref: sel.base || null, whole_project: !sel.base, paths: n === total ? [] : compactSelection() });
+        if (seq === selSeq) box.textContent = estimateText(est) + quotaWarning(est.requests);
+      } catch (e) { if (seq === selSeq) box.textContent = e.message; }
+    }, 400);
+  }
+
+  async function openSelect(base) {
+    const p = state.project;
+    Object.assign(sel, { files: [], root: null, base, q: '' });
+    sel.chosen = new Set();
+    sel.open = new Set();
+    $('#selectSearch').value = '';
+    $('#selectScope').textContent = base ? `Files changed since ${base}` : 'Whole project';
+    clear($('#tree')).append(el('div', { class: 'list-empty' }, el('div', { class: 'spinner' }), 'Listing files…'));
+    $('#selectEstimate').textContent = '';
+    $('#selectRun').disabled = true;
+    $('#selectModal').showModal();
+    let data;
+    try {
+      data = await api('GET', `/api/projects/${p.id}/files?${new URLSearchParams(base ? { base_ref: base } : { whole_project: 'true' })}`);
+    } catch (e) {
+      clear($('#tree')).append(el('div', { class: 'form-error', text: e.message }));
+      return;
+    }
+    if (!state.project || state.project.id !== p.id) return;
+    sel.files = data.files;
+    sel.byPath = new Map(data.files.map((f) => [f.path, f]));
+    sel.root = buildTree(data.files);
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(`cr-sel-${p.id}`) || 'null'); } catch (e) { /* storage unavailable */ }
+    const inSaved = (path) => saved.some((s2) => path === s2 || path.startsWith(`${s2}/`));
+    for (const f of data.files) if (f.reviewable && (!saved || !saved.length || inSaved(f.path))) sel.chosen.add(f.path);
+    if (!sel.chosen.size) for (const f of data.files) if (f.reviewable) sel.chosen.add(f.path);
+    // open the first levels so the structure is visible
+    const openTop = (node, depth) => { for (const d of node.dirs.values()) { if (depth < 2) { sel.open.add(d.path); openTop(d, depth + 1); } } };
+    openTop(sel.root, 0);
+    if (!data.files.length) {
+      clear($('#tree')).append(el('div', { class: 'list-empty', text: base ? `Nothing changed since ${base}.` : 'No reviewable files found.' }));
+      return;
+    }
+    afterSelect();
+  }
+
+  let selSearchTimer = null;
+  $('#selectSearch').addEventListener('input', (e) => {
+    clearTimeout(selSearchTimer);
+    selSearchTimer = setTimeout(() => { sel.q = e.target.value.trim().toLowerCase(); renderTree(); }, 120);
+  });
+  $('#selectAll').addEventListener('click', () => {
+    const pool = sel.q ? sel.files.filter((f) => f.path.toLowerCase().includes(sel.q)) : sel.files;
+    for (const f of pool) if (f.reviewable) sel.chosen.add(f.path);
+    afterSelect();
+  });
+  $('#selectNone').addEventListener('click', () => {
+    if (sel.q) { for (const f of sel.files) if (f.path.toLowerCase().includes(sel.q)) sel.chosen.delete(f.path); } else sel.chosen.clear();
+    afterSelect();
+  });
+  $('#selectForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (!sel.chosen.size || !sel.root) return;
+    const all = sel.chosen.size === sel.root.all.length;
+    const paths = all ? [] : compactSelection();
+    try { localStorage.setItem(`cr-sel-${state.project.id}`, JSON.stringify(paths)); } catch (err) { /* storage unavailable */ }
+    $('#selectModal').close();
+    runScan({ base_ref: sel.base || null, whole_project: !sel.base, paths });
+  });
+
+  // ------------------------------------------------------------------ AI settings
+  const settingsForm = $('#settingsForm');
+  const NUMBER_FIELDS = ['max_lines_per_request', 'max_workers', 'max_files', 'whole_file_up_to', 'context_lines', 'daily_request_limit'];
+  let settingsData = null;
+
+  function fillProviders() {
+    const select = clear($('#setProvider'));
+    const keys = settingsData.keys || {};
+    const name = { gemini: 'Gemini', groq: 'Groq', openai: 'OpenAI', ollama: 'Ollama (local)' };
+    select.append(el('option', { value: '', text: 'Automatic (from the key in .env)' }));
+    for (const p of ['gemini', 'groq', 'openai', 'ollama']) {
+      const note = p === 'ollama' ? '' : keys[p] ? ' · key found' : ' · no key in .env';
+      select.append(el('option', { value: p, text: `${name[p]}${note}` }));
+    }
+  }
+
+  function updateModelPlaceholder() {
+    const provider = $('#setProvider').value || (state.ai && state.ai.provider) || '';
+    const model = (settingsData.default_models || {})[provider];
+    $('#setModel').placeholder = model ? `default: ${model}` : 'provider default';
+  }
+
+  function fillSettings(data) {
+    settingsData = data;
+    const v = data.values;
+    fillProviders();
+    const f = settingsForm.elements;
+    f.provider.value = v.provider || '';
+    f.model.value = v.model || '';
+    f.focus.value = (v.focus || []).join('\n');
+    f.min_confidence.value = v.min_confidence ?? 0.5;
+    $('#confOut').textContent = `${Math.round(100 * Number(f.min_confidence.value))}%`;
+    f.summary.checked = v.summary !== false;
+    for (const k of NUMBER_FIELDS) f[k].value = v[k] ?? 0;
+    f.exclude.value = (v.exclude || []).join('\n');
+    $('#settingsFile').textContent = data.customized.length
+      ? `Changed from reviewer.yml: ${data.customized.join(', ')}. Saved in ${data.file}.`
+      : 'Using the values from reviewer.yml.';
+    updateModelPlaceholder();
+  }
+
+  async function openSettings() {
+    show($('#settingsError'), false);
+    $('#testAiResult').textContent = '';
+    try { fillSettings(await api('GET', '/api/settings')); } catch (e) { toast(e.message, 'error'); return; }
+    $('#settingsModal').showModal();
+  }
+  $('#aiSettingsBtn').addEventListener('click', () => { openSidebar(false); openSettings(); });
+  $('#setProvider').addEventListener('change', updateModelPlaceholder);
+  settingsForm.elements.min_confidence.addEventListener('input', (e) => { $('#confOut').textContent = `${Math.round(100 * Number(e.target.value))}%`; });
+
+  settingsForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = settingsForm.elements;
+    const lines = (text) => text.split('\n').map((x) => x.trim()).filter(Boolean);
+    const body = {
+      provider: f.provider.value, model: f.model.value.trim(), focus: lines(f.focus.value),
+      min_confidence: Number(f.min_confidence.value), summary: f.summary.checked, exclude: lines(f.exclude.value),
+    };
+    for (const k of NUMBER_FIELDS) body[k] = Number(f[k].value || 0);
+    $('#saveSettingsBtn').disabled = true;
+    try {
+      const data = await api('PUT', '/api/settings', body);
+      state.ai = data.ai;
+      $('#settingsModal').close();
+      toast('Settings saved');
+      loadAiStatus();
+    } catch (err) {
+      $('#settingsError').textContent = err.message;
+      show($('#settingsError'), true);
+    } finally { $('#saveSettingsBtn').disabled = false; }
+  });
+
+  $('#resetSettingsBtn').addEventListener('click', async () => {
+    if (!window.confirm('Go back to the values in reviewer.yml? Your saved settings will be removed.')) return;
+    try {
+      const data = await api('DELETE', '/api/settings');
+      fillSettings(data);
+      toast('Settings reset to reviewer.yml');
+      loadAiStatus();
+    } catch (err) { toast(err.message, 'error'); }
+  });
+
+  $('#testAiBtn').addEventListener('click', async () => {
+    const out = $('#testAiResult');
+    out.className = 'small';
+    out.textContent = 'Testing…';
+    $('#testAiBtn').disabled = true;
+    try {
+      const res = await api('POST', '/api/ai/test');
+      out.className = `small ${res.ok ? 'ok-text' : 'err-text'}`;
+      out.textContent = res.ok ? `${res.label} works (${res.message})` : `${res.label}: ${res.message}`;
+      loadAiStatus();
+    } catch (err) {
+      out.className = 'small err-text';
+      out.textContent = err.message;
+    } finally { $('#testAiBtn').disabled = false; }
+  });
 
   // ------------------------------------------------------------------ project modal
   const projectForm = $('#projectForm');
@@ -751,8 +1287,11 @@
     show($('#deleteProjectBtn'), Boolean(project));
     show($('#sourceField'), !project);
     projectForm.elements.path_or_url.disabled = Boolean(project);
+    const rulesCount = project ? (project.rules || '').split('\n').filter((x) => x.trim()).length : 0;
+    $('#rulesCount').textContent = rulesCount ? `(${rulesCount})` : '';
+    $('#rulesSection').open = rulesCount > 0;
     if (project) {
-      for (const key of ['name', 'path_or_url', 'base_ref']) projectForm.elements[key].value = project[key] || '';
+      for (const key of ['name', 'path_or_url', 'base_ref', 'rules', 'extra_exclude']) projectForm.elements[key].value = project[key] || '';
       projectForm.elements.source_type.value = project.source_type;
     }
     $('#saveProjectBtn').textContent = 'Save project';
@@ -813,13 +1352,17 @@
         form.append('name', data.name);
         form.append('file', zipFile);
         project = await uploadForm('/api/projects/zip', form, progressText);
+        if (data.rules || data.extra_exclude) {
+          project = await api('PATCH', `/api/projects/${project.id}`, { rules: data.rules, extra_exclude: data.extra_exclude });
+        }
       } else if (editingId) {
         if (isZip && zipFile) {
           const form = new FormData();
           form.append('file', zipFile);
           await uploadForm(`/api/projects/${editingId}/zip`, form, progressText);
         }
-        const patch = isZip ? { name: data.name } : { name: data.name, base_ref: data.base_ref };
+        const patch = { name: data.name, rules: data.rules, extra_exclude: data.extra_exclude };
+        if (!isZip) patch.base_ref = data.base_ref;
         project = await api('PATCH', `/api/projects/${editingId}`, patch);
       } else {
         project = await api('POST', '/api/projects', data);

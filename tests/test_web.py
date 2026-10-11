@@ -95,3 +95,50 @@ def test_failed_zip_upload_leaves_no_project(client):
     resp = client.post("/api/projects/zip", data={"name": "x"}, files=only_binaries)
     assert resp.status_code == 400 and "no source files" in resp.json()["detail"]
     assert client.get("/api/projects").json() == []
+
+
+def test_settings_api(client):
+    view = client.get("/api/settings").json()
+    assert view["values"]["max_files"] == 1000 and view["customized"] == [] and "gemini" in view["keys"]
+    body = {**view["values"], "max_files": 50, "focus": ["only security", "  "], "daily_request_limit": 20}
+    saved = client.put("/api/settings", json=body).json()
+    assert saved["values"]["max_files"] == 50 and saved["values"]["focus"] == ["only security"]
+    assert saved["customized"] == ["daily_request_limit", "focus", "max_files"]   # only what differs is stored
+    assert saved["ai"]["daily_request_limit"] == 20
+    assert client.put("/api/settings", json={**body, "max_workers": 99}).status_code == 422
+    assert client.put("/api/settings", json={**body, "provider": "evil"}).status_code == 422
+    assert client.delete("/api/settings").json()["customized"] == []
+
+
+def test_files_estimate_scan_with_selection_and_exports(client, tmp_path, monkeypatch):
+    from app.core.ai_review import AIReviewer
+
+    monkeypatch.setenv("GROQ_API_KEY", "test")
+    monkeypatch.setattr(AIReviewer, "complete_json", lambda self, s, u: ({"summary": "ok"} if '"summary"' in u else {"issues": [
+        {"file": "src/A.java", "line": 2, "severity": "HIGH", "category": "bug", "title": "Bad", "confidence": 0.9,
+         "fix": "    int a = 2;"}]}, False))
+    proj = tmp_path / "proj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "lib").mkdir()
+    (proj / "src" / "A.java").write_text("class A {\n    int a = 1;\n}\n")
+    (proj / "lib" / "B.java").write_text("class B {\n}\n")
+    pid = client.post("/api/projects", json={"name": "P", "source_type": "local", "path_or_url": str(proj),
+                                             "rules": "check roles"}).json()["id"]
+    files = client.get(f"/api/projects/{pid}/files?whole_project=true").json()["files"]
+    assert [f["path"] for f in files] == ["lib/B.java", "src/A.java"]
+    est = client.post(f"/api/projects/{pid}/estimate", json={"whole_project": True, "paths": ["src"]}).json()
+    assert est["files"] == 1 and est["requests"] == 1
+    assert client.post(f"/api/projects/{pid}/estimate", json={"paths": ["../x"]}).status_code == 400
+    sid = client.post(f"/api/projects/{pid}/scans", json={"whole_project": True, "paths": ["src"]}).json()["scan_id"]
+    scan = client.get(f"/api/scans/{sid}").json()
+    assert scan["status"] == "done", scan.get("error")
+    assert [f["path"] for f in scan["result"]["files"]] == ["src/A.java"] and scan["result"]["comparison"] is None
+    sid2 = client.post(f"/api/projects/{pid}/scans", json={"whole_project": True}).json()["scan_id"]
+    second = client.get(f"/api/scans/{sid2}").json()["result"]
+    assert second["comparison"]["fixed"] == [] and second["findings"][0]["is_new"] is False
+    assert len(client.get(f"/api/projects/{pid}/history").json()) == 2
+    csv_resp = client.get(f"/api/scans/{sid2}/export/csv")
+    assert csv_resp.status_code == 200 and "Bad" in csv_resp.text and "attachment" in csv_resp.headers["content-disposition"]
+    patch = client.get(f"/api/scans/{sid2}/export/patch")
+    assert patch.headers["x-fixes-applied"] == "1" and "+    int a = 2;" in patch.text
+    assert client.get(f"/api/scans/{sid2}/export/exe").status_code == 404

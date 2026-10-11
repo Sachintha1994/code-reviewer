@@ -191,8 +191,10 @@ def render_chunk(lines: List[str], numbers: List[int], changed: Set[int]) -> str
 
 class AIReviewer:
     def __init__(self, cfg: Dict[str, Any], cache_get: Optional[Callable[[str], Optional[str]]] = None,
-                 cache_set: Optional[Callable[[str, str], None]] = None):
+                 cache_set: Optional[Callable[[str, str], None]] = None,
+                 on_request: Optional[Callable[[str, str], None]] = None):
         self.cfg = cfg.get("ai") or {}
+        self.on_request = on_request   # called after each request the provider answered (usage meter)
         self.cache_get = cache_get or (lambda key: None)
         self.cache_set = cache_set or (lambda key, value: None)
         self.provider, self.model, self.base_url, self.api_key, self.reason = self._resolve()
@@ -244,6 +246,20 @@ class AIReviewer:
         configured = int(self.cfg.get("max_lines_per_request") or 0)
         return configured or PROVIDER_BATCH_LINES.get(self.provider or "", 1000)
 
+    def _counted(self, response):
+        if self.on_request:
+            try:
+                self.on_request(self.provider or "", self.model)
+            except Exception:  # the meter must never break a review
+                pass
+        return response
+
+    def test_connection(self) -> str:
+        """Send one tiny request (not cached). Returns the model's reply."""
+        reply = self._create([{"role": "system", "content": "Reply with one JSON object only."},
+                              {"role": "user", "content": 'Reply with {"ok": true}.'}])
+        return (reply.choices[0].message.content or "").strip()[:200]
+
     def _create(self, messages: List[Dict[str, str]]):
         """One chat completion, waiting out short rate limits and stopping on an exhausted quota."""
         client = self._get_client()
@@ -251,8 +267,8 @@ class AIReviewer:
             try:
                 if self._json_mode:
                     try:
-                        return client.chat.completions.create(model=self.model, messages=messages, temperature=0.1,
-                                                              response_format={"type": "json_object"})
+                        return self._counted(client.chat.completions.create(
+                            model=self.model, messages=messages, temperature=0.1, response_format={"type": "json_object"}))
                     except Exception as exc:
                         # Some providers reject JSON mode with a 400; the prompt already asks for JSON only.
                         text = str(exc).lower()
@@ -261,7 +277,7 @@ class AIReviewer:
                             self._json_mode = False
                         else:
                             raise
-                return client.chat.completions.create(model=self.model, messages=messages, temperature=0.1)
+                return self._counted(client.chat.completions.create(model=self.model, messages=messages, temperature=0.1))
             except Exception as exc:
                 text = str(exc)
                 limited = getattr(exc, "status_code", None) == 429 or "rate limit" in text.lower() or "quota" in text.lower()

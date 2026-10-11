@@ -73,6 +73,26 @@ request carries more code.
 Secrets that look real (API keys, tokens, random-looking passwords) are masked before any code
 is sent to the AI. Results are cached, so re-reviewing an unchanged file costs nothing.
 
+## Dashboard
+
+- **Since the previous review:** every review is compared with the one before it. Issues are
+  marked *new*, the card shows how many were fixed (click to list them), and *New only* filters
+  the list. An issue only counts as fixed when its file was reviewed again.
+- **Issues over time:** a chart of every review; click a point to open that review.
+- **Choose folders and files:** in the menu next to **Run review**, pick folders or files in a
+  tree and see how many files, lines and AI requests the review will take before starting it.
+  The menu also estimates the requests for a full or branch review.
+- **Export:** PDF, Markdown (paste into a pull request), CSV (opens in Excel), JSON, or a patch
+  with every suggested fix (`git apply --3way review_fixes.patch`). Fixes whose code has changed
+  since the review are left out.
+- **AI settings** (sidebar): provider, model, focus areas, confidence, request size, parallel
+  requests, limits and excluded files, with a button to test the connection. Saved to
+  `data/settings.yml` on top of `reviewer.yml`; API keys stay in `.env`.
+- **AI requests in the last 24 hours** (sidebar): set `daily_request_limit` (e.g. 20 for
+  Gemini's free tier) to see it as a meter. Estimates warn when a review needs more than what's left.
+- **Review rules per project** (Project settings): extra things the AI should check and extra
+  files to skip, for that project only.
+
 ## Handling issues
 
 - **False positive** or **Ignore** in the dashboard: remembered for the project, and the
@@ -85,7 +105,8 @@ is sent to the AI. Results are cached, so re-reviewing an unchanged file costs n
 ZIP uploads are checked before unpacking: paths that escape the folder, symlinks, more than
 50,000 files or more than 1 GB unpacked are refused (limits in `reviewer.yml` under `uploads`).
 
-`reviewer.yml` holds the AI provider and model (Gemini, Groq, OpenAI or a local Ollama model; set `ai.model` to switch models, e.g. a Gemini Pro model for deeper reviews), what the AI should look for (`ai.focus`, edit
+`reviewer.yml` holds the defaults (the dashboard's AI settings page saves changes to
+`data/settings.yml`, which overrides them). It sets the AI provider and model (Gemini, Groq, OpenAI or a local Ollama model; set `ai.model` to switch models, e.g. a Gemini Pro model for deeper reviews), what the AI should look for (`ai.focus`, edit
 it to match your team's standards), size limits, excluded folders and the folders the dashboard
 may open. A project can override any value with its own `reviewer.yml` in its root, and
 exclude files with a `.reviewerignore`.
@@ -108,9 +129,11 @@ app/web/                   dashboard page, styles and script (works offline)
 app/core/orchestrator.py   finds changes, runs the AI review, builds the result
 app/core/ai_review.py      prompts, chunking, provider setup
 app/core/findings.py       duplicates, ignores, fingerprints, verdict
+app/core/compare.py        new and fixed issues since the previous review
 app/core/diff.py           git diff parsing
 app/core/uploads.py        safe ZIP extraction
 app/core/storage.py        SQLite: projects, review history, ignored issues, AI cache
 app/reports/pdf_report.py  PDF export
+app/reports/exports.py     CSV, Markdown, JSON and patch exports
 tests/                     tests (the AI is replaced by a fake)
 ```

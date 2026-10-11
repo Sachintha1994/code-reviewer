@@ -30,8 +30,10 @@ def _now() -> str:
 class CodeReviewOrchestrator:
     def __init__(self, target_path: str, base_ref: Optional[str] = None, config_overrides: Optional[dict] = None,
                  suppressions: Optional[Dict[str, str]] = None, progress: Optional[ProgressFn] = None,
-                 cache_get=None, cache_set=None):
+                 cache_get=None, cache_set=None, include_paths: Optional[List[str]] = None, on_request=None):
         self.root = Path(target_path).expanduser().resolve()
+        self.include_paths = normalize_paths(include_paths)
+        self.on_request = on_request
         self.base_ref = base_ref
         self.config_overrides = config_overrides
         self.suppressions = suppressions or {}
@@ -41,19 +43,13 @@ class CodeReviewOrchestrator:
     def _emit(self, stage: str, message: str, **extra: Any) -> None:
         self.progress({"stage": stage, "message": message, **extra})
 
-    def run_full_review(self) -> ReviewResult:
-        started = _now()
+    def _prepare(self):
         if not self.root.is_dir():
             raise ValueError(f"folder not found: {self.root}")
         clear_line_cache()
         cfg = load_config(self.root, self.config_overrides)
         ai_cfg = cfg.get("ai") or {}
         base_ref = (self.base_ref if self.base_ref is not None else cfg.get("base_ref") or "").strip()
-
-        reviewer = AIReviewer(cfg, self.cache_get, self.cache_set)
-        if not reviewer.available:
-            raise ValueError(reviewer.reason)
-
         excludes = exclude_patterns(self.root, cfg)
         if base_ref:
             self._emit("diff", f"Finding changes since {base_ref}")
@@ -63,8 +59,44 @@ class CodeReviewOrchestrator:
             self._emit("diff", "Reviewing the whole project (no base branch set)")
             added = self._whole_project(excludes)
             removed, changed_files = 0, sorted(added)
+        if self.include_paths:
+            added = {p: v for p, v in added.items() if in_selection(p, self.include_paths)}
+            changed_files = [p for p in changed_files if in_selection(p, self.include_paths)]
+        return cfg, ai_cfg, base_ref, excludes, added, removed, changed_files
+
+    def candidates(self) -> List[Dict[str, Any]]:
+        """Files a review would look at, before any selection: path, lines in scope and whether it's reviewable."""
+        keep, self.include_paths = self.include_paths, []
+        try:
+            cfg, ai_cfg, base_ref, excludes, added, _, _ = self._prepare()
+        finally:
+            self.include_paths = keep
+        files, _ = self._plan(added, excludes, ai_cfg, whole=not base_ref, limit_files=False)
+        return [{"path": f.path, "lines": f.lines_added, "reviewable": f.status == "pending", "note": f.message}
+                for f in files]
+
+    def estimate(self) -> Dict[str, Any]:
+        """How much a review would send to the AI, without calling it."""
+        cfg, ai_cfg, base_ref, excludes, added, _, _ = self._prepare()
         files, to_review = self._plan(added, excludes, ai_cfg, whole=not base_ref)
-        self._emit("review", f"Reviewing {len(to_review)} changed files with {reviewer.label}", total=len(to_review))
+        reviewer = AIReviewer(cfg)
+        batches = reviewer.plan_requests(self.root, [(p, set(added[p])) for p in to_review]) if to_review else []
+        return {"files": len(to_review), "lines": sum(len(added[p]) for p in to_review), "requests": len(batches),
+                "skipped": sum(1 for f in files if f.status == "skipped"), "lines_per_request": reviewer.batch_lines}
+
+    def run_full_review(self) -> ReviewResult:
+        started = _now()
+        if not self.root.is_dir():
+            raise ValueError(f"folder not found: {self.root}")
+        cfg = load_config(self.root, self.config_overrides)
+        reviewer = AIReviewer(cfg, self.cache_get, self.cache_set, on_request=self.on_request)
+        if not reviewer.available:
+            raise ValueError(reviewer.reason)
+        cfg, ai_cfg, base_ref, excludes, added, removed, changed_files = self._prepare()
+        if self.include_paths and not added:
+            raise ValueError("none of the selected files have anything to review")
+        files, to_review = self._plan(added, excludes, ai_cfg, whole=not base_ref)
+        self._emit("review", f"Reviewing {len(to_review)} files with {reviewer.label}", total=len(to_review))
         for f in files:
             if f.status == "skipped":
                 self.progress({"stage": "review", "tool": f.path, "status": "skipped", "message": f.message})
@@ -167,6 +199,7 @@ class CodeReviewOrchestrator:
             "by_severity": fx.counts_by_severity(findings),
             "requests": len(batches), "files_quota_skipped": len(quota_skipped),
             "cached_files": sum(1 for f in reviewed if f.cached),
+            "selection": self.include_paths[:200],
         }
         self._emit("done", f"{label}: {reason}", verdict=verdict)
         return ReviewResult(
@@ -204,7 +237,7 @@ class CodeReviewOrchestrator:
         return added
 
     def _plan(self, added: Dict[str, Dict[int, str]], excludes: List[str], ai_cfg: Dict[str, Any],
-              whole: bool = False) -> Tuple[List[FileReview], List[str]]:
+              whole: bool = False, limit_files: bool = True) -> Tuple[List[FileReview], List[str]]:
         max_files = int(ai_cfg.get("max_files", 1000))
         too_big = int(ai_cfg.get("skip_files_with_more_changed_lines_than", 3000))
         files: List[FileReview] = []
@@ -220,12 +253,29 @@ class CodeReviewOrchestrator:
                 review.status, review.message = "skipped", "not a source or config file"
             elif len(lines) > too_big:
                 review.status, review.message = "skipped", f"{len(lines)} {'lines' if whole else 'changed lines'}; too large to review"
-            elif len(to_review) >= max_files:
+            elif limit_files and len(to_review) >= max_files:
                 review.status, review.message = "skipped", f"limit of {max_files} files per scan (ai.max_files)"
             else:
                 to_review.append(path)
             files.append(review)
         return files, to_review
+
+
+def normalize_paths(paths: Optional[List[str]]) -> List[str]:
+    """Selected files or folders, as clean relative paths. Rejects anything that leaves the project."""
+    out: List[str] = []
+    for raw in paths or []:
+        p = str(raw).replace("\\", "/").strip().strip("/")
+        if not p or p == ".":
+            continue
+        if p.startswith("~") or ":" in p.split("/")[0] or any(part == ".." for part in p.split("/")):
+            raise ValueError(f"invalid path in selection: {raw}")
+        out.append(p)
+    return sorted(set(out))
+
+
+def in_selection(path: str, selection: List[str]) -> bool:
+    return any(path == s or path.startswith(s + "/") for s in selection)
 
 
 def validate_github_url(url: str) -> str:

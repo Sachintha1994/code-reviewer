@@ -22,6 +22,7 @@ ai:
   min_confidence: 0.5       # issues the AI is less sure about are dropped
   max_workers: 2            # AI requests sent in parallel (keep low on free API tiers)
   summary: true             # write a short summary of the whole change
+  daily_request_limit: 0    # your provider's daily request quota, shown as a meter in the dashboard (0 = none)
   # What to look for. Edit to match your team's standards.
   focus:
     - bugs and logic errors, including wrong edge cases and off-by-one errors

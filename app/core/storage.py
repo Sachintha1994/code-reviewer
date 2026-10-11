@@ -31,9 +31,17 @@ CREATE TABLE IF NOT EXISTS baselines (
     project_id TEXT NOT NULL, fingerprint TEXT NOT NULL, PRIMARY KEY(project_id, fingerprint)
 );
 CREATE TABLE IF NOT EXISTS ai_cache (key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ai_usage (
+    hour TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(hour, provider, model)
+);
 """
 
-PROJECT_FIELDS = ("name", "source_type", "path_or_url", "base_ref")
+PROJECT_FIELDS = ("name", "source_type", "path_or_url", "base_ref", "rules", "extra_exclude")
+MIGRATIONS = (  # columns added after the first release
+    "ALTER TABLE projects ADD COLUMN rules TEXT DEFAULT ''",
+    "ALTER TABLE projects ADD COLUMN extra_exclude TEXT DEFAULT ''",
+)
 
 
 def now() -> str:
@@ -50,6 +58,10 @@ class Storage:
         with self._lock:
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.executescript(SCHEMA)
+            columns = {r[1] for r in self._conn.execute("PRAGMA table_info(projects)").fetchall()}
+            for sql in MIGRATIONS:
+                if sql.split()[5] not in columns:
+                    self._conn.execute(sql)
             # Scans left running when the server stopped will never finish.
             self._conn.execute("UPDATE scans SET status='error', error='server restarted during scan' WHERE status='running'")
             self._conn.commit()
@@ -132,9 +144,27 @@ class Storage:
         return self.get_scan(rows[0]["id"]) if rows else None
 
     def history(self, project_id: str, limit: int = 30) -> List[Dict[str, Any]]:
-        rows = self._all("""SELECT id, status, started_at, finished_at, verdict, score, grade FROM scans
+        """Finished reviews, oldest first, with their headline numbers."""
+        rows = self._all("""SELECT id, started_at, finished_at, verdict, result_json FROM scans
                             WHERE project_id=? AND status='done' ORDER BY started_at DESC LIMIT ?""", (project_id, limit))
-        return list(reversed(rows))
+        out = []
+        for row in reversed(rows):
+            try:
+                result = json.loads(row.pop("result_json") or "{}")
+            except ValueError:
+                result = {}
+            stats = result.get("stats") or {}
+            if "files" not in result:
+                continue  # made by the old scanner-based version
+            out.append({**row, "verdict_label": result.get("verdict_label"), "base_ref": result.get("base_ref", ""),
+                        "issues": stats.get("issues", 0), "by_severity": stats.get("by_severity") or {},
+                        "files_reviewed": stats.get("files_reviewed", 0), "selection": bool(stats.get("selection"))})
+        return out
+
+    def latest_done_scan(self, project_id: str) -> Optional[Dict[str, Any]]:
+        rows = self._all("""SELECT id FROM scans WHERE project_id=? AND status='done'
+                            ORDER BY started_at DESC LIMIT 1""", (project_id,))
+        return self.get_scan(rows[0]["id"]) if rows else None
 
     # suppressions and baselines ---------------------------------------------- #
     def add_suppression(self, project_id: str, fingerprint: str, kind: str, reason: str = "") -> None:
@@ -156,3 +186,16 @@ class Storage:
 
     def cache_set(self, key: str, value: str) -> None:
         self._exec("INSERT OR REPLACE INTO ai_cache VALUES (?, ?, ?)", (key, value, now()))
+
+    # AI usage ------------------------------------------------------------------ #
+    def add_usage(self, provider: str, model: str, requests: int = 1) -> None:
+        hour = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+        self._exec("""INSERT INTO ai_usage VALUES (?, ?, ?, ?)
+                      ON CONFLICT(hour, provider, model) DO UPDATE SET requests = requests + excluded.requests""",
+                   (hour, provider or "", model or "", requests))
+
+    def usage_last_24h(self, provider: str, model: str) -> int:
+        since = datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() - 23 * 3600, timezone.utc).strftime("%Y-%m-%dT%H")
+        rows = self._all("SELECT COALESCE(SUM(requests), 0) AS n FROM ai_usage WHERE hour >= ? AND provider=? AND model=?",
+                         (since, provider or "", model or ""))
+        return int(rows[0]["n"]) if rows else 0

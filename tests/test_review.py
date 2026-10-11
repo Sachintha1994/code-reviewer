@@ -429,3 +429,140 @@ def test_short_rate_limit_waits_and_daily_limit_stops(monkeypatch):
     r._client = fake_client([RateLimit("429 Quota exceeded, limit: 20. Please retry in 22h3m1s")])
     with pytest.raises(QuotaExhausted, match="about 22 hours"):
         r.complete_json("s", "b")
+
+
+# ------------------------------------------------------- comparison, selection, exports
+from app.core.compare import compare_results  # noqa: E402
+from app.core.orchestrator import in_selection, normalize_paths  # noqa: E402
+from app.reports.exports import to_csv, to_markdown, to_patch  # noqa: E402
+
+
+def _issue(fp, path="src/A.java", sev="HIGH", suppressed=None):
+    return {"fingerprint": fp, "file_path": path, "line": 2, "severity": sev, "category": "bug", "title": fp,
+            "suppressed": suppressed}
+
+
+def test_compare_marks_new_fixed_and_respects_scope():
+    previous = {"files": [], "verdict": "FAIL", "findings": [
+        _issue("a"), _issue("b"), _issue("c", path="src/Other.java"), _issue("d", suppressed="ignored")]}
+    current = {"files": [{"path": "src/A.java", "status": "reviewed"}], "findings": [_issue("b"), _issue("e")]}
+    out = compare_results(current, previous, {"id": "s1", "finished_at": "t"})
+    assert {f["fingerprint"]: f["is_new"] for f in out["findings"]} == {"b": False, "e": True}
+    # c's file wasn't reviewed this time and d was ignored, so neither counts as fixed
+    assert [f["fingerprint"] for f in out["comparison"]["fixed"]] == ["a"]
+    assert out["comparison"]["previous_issues"] == 3 and out["comparison"]["previous_scan_id"] == "s1"
+    first = compare_results(current, None)
+    assert first["comparison"] is None and all(f["is_new"] is None for f in first["findings"])
+
+
+def test_rescore_keeps_new_flags():
+    result = compare_results({"files": [], "findings": [{**_issue("x"), "line": 3}]}, {"files": [], "findings": []})
+    out = rescore(result, {"x": "ignored"})
+    assert out["findings"][0]["is_new"] is True and out["comparison"] == {**result["comparison"]}
+
+
+def test_selection_paths_are_validated():
+    assert normalize_paths(["src/main/", "src\\main", "pom.xml", ""]) == ["pom.xml", "src/main"]
+    for bad in (["../etc"], ["src/../../x"], ["C:/Windows"], ["~/x"]):
+        with pytest.raises(ValueError):
+            normalize_paths(bad)
+    assert in_selection("src/main/A.java", ["src/main"]) and not in_selection("src/mainly/A.java", ["src/main"])
+
+
+def test_review_of_selected_folders_and_estimate(tmp_path, monkeypatch):
+    calls = fake_ai(monkeypatch, [])
+    repo = make_project(tmp_path, 3)
+    (repo / "lib").mkdir()
+    (repo / "lib" / "L.java").write_text("class L {\n}\n")
+    orch = CodeReviewOrchestrator(str(repo), base_ref="", include_paths=["lib"], config_overrides={"ai": {"summary": False}})
+    assert orch.estimate() == {"files": 1, "lines": 2, "requests": 1, "skipped": 0, "lines_per_request": 500}
+    assert len(orch.candidates()) == 4                      # candidates ignore the selection
+    result = orch.run_full_review()
+    assert [f.path for f in result.files] == ["lib/L.java"] and result.stats["selection"] == ["lib"]
+    assert "### File: lib/L.java" in calls[0] and "C000" not in calls[0]
+    with pytest.raises(ValueError, match="none of the selected"):
+        CodeReviewOrchestrator(str(repo), base_ref="", include_paths=["nothing"]).run_full_review()
+
+
+def test_exports(tmp_path):
+    root = tmp_path / "p"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "A.java").write_bytes(b"class A {\r\n    int a = 1;\r\n    int b = 2;\r\n}\r\n")
+    findings = [
+        {**_issue("one"), "line": 2, "end_line": 2, "context": "    int a = 1;", "fix": "    final int a = 1;",
+         "explanation": "Should be final, with \"quotes\", commas", "confidence": 0.9, "is_new": True},
+        {**_issue("two", sev="LOW"), "line": 3, "end_line": 3, "context": "    int b = 999;", "fix": "    int b = 3;"},
+        {**_issue("ign"), "line": 3, "context": "    int b = 2;", "fix": "x", "suppressed": "ignored: no"},
+    ]
+    result = {"base_ref": "", "verdict_label": "Changes requested", "verdict_reason": "1 high", "model": "m",
+              "stats": {"files_reviewed": 1, "issues": 2, "by_severity": {"HIGH": 1, "LOW": 1}}, "findings": findings,
+              "comparison": {"fixed": [{"title": "gone"}]}, "summary": "Sum."}
+    csv_text = to_csv(result)
+    assert csv_text.startswith("\ufeffSeverity") and '"Should be final, with ""quotes"", commas"' in csv_text
+    assert "ign" not in csv_text and "ignored: no" in to_csv(result, include_ignored=True)
+    md = to_markdown("Demo", result)
+    assert "# AI code review: Demo" in md and "1 new, 1 fixed" in md and "```java" not in md and "### one" in md
+    patch, counts = to_patch(result, root)
+    assert counts == {"applied": 1, "skipped": 1}           # "two" no longer matches the file
+    assert "-    int a = 1;\r\n+    final int a = 1;\r\n" in patch and "+++ b/src/A.java\n" in patch
+    # the patch applies with git
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    (root / "fix.patch").write_bytes(patch.encode())
+    subprocess.run(["git", "apply", "fix.patch"], cwd=root, check=True)
+    assert b"final int a = 1;\r\n" in (root / "src" / "A.java").read_bytes()
+
+
+def test_usage_and_history(tmp_path):
+    st = Storage(tmp_path / "db.sqlite")
+    st.add_usage("gemini", "m")
+    st.add_usage("gemini", "m", 4)
+    st.add_usage("groq", "x")
+    assert st.usage_last_24h("gemini", "m") == 5
+    p = st.add_project({"name": "x", "source_type": "local", "path_or_url": "/x", "rules": "a\nb"})
+    assert p["rules"] == "a\nb" and p["extra_exclude"] == ""
+    sid = st.start_scan(p["id"])
+    st.finish_scan(sid, {"verdict": "WARN", "verdict_label": "Approve with comments", "files": [], "findings": [],
+                         "stats": {"issues": 2, "by_severity": {"MEDIUM": 2}, "selection": ["src"]}})
+    old = st.start_scan(p["id"])
+    st.finish_scan(old, {"verdict": "FAIL"})                 # from the old scanner version: left out
+    hist = st.history(p["id"])
+    assert len(hist) == 1 and hist[0]["issues"] == 2 and hist[0]["selection"] is True
+    assert st.latest_done_scan(p["id"])["id"] == old
+
+
+def test_old_database_gets_new_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, source_type TEXT NOT NULL, "
+                "path_or_url TEXT NOT NULL, base_ref TEXT DEFAULT '', created_at TEXT NOT NULL)")
+    con.execute("INSERT INTO projects VALUES ('p1', 'Old', 'local', '/x', 'main', 't')")
+    con.commit()
+    con.close()
+    st = Storage(path)
+    assert st.get_project("p1")["rules"] == ""
+    assert st.update_project("p1", {"rules": "check roles"})["rules"] == "check roles"
+
+
+def test_dashboard_settings_layer(tmp_path, monkeypatch):
+    import importlib
+
+    import app.config as config
+
+    monkeypatch.setenv("REVIEWER_DATA_DIR", str(tmp_path / "data"))
+    config = importlib.reload(config)
+    try:
+        assert config.load_config()["ai"]["max_files"] == 1000
+        config.write_ui_settings({"ai": {"max_files": 5, "model": "gemini-x"}, "exclude": ["only/this"]})
+        cfg = config.load_config()
+        assert cfg["ai"]["max_files"] == 5 and cfg["ai"]["model"] == "gemini-x" and cfg["exclude"] == ["only/this"]
+        assert cfg["ai"]["context_lines"] == 25                # untouched values still come from reviewer.yml
+        assert config.load_config(ui_settings=False)["ai"]["max_files"] == 1000
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "reviewer.yml").write_text("ai:\n  max_files: 9\n")
+        assert config.load_config(project)["ai"]["max_files"] == 9   # a project's own file wins
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)
